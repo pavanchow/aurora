@@ -59,6 +59,7 @@ pub fn exec(line: &str) -> bool {
             println!("  vault put <k> <v>    store a secret encrypted in RAM");
             println!("  vault get <k>        decrypt and show a secret");
             println!("  vault list           list stored secret names");
+            println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
             println!("  panic                trigger a kernel panic (wipes on the way down)");
             println!("  exit                 wipe and shut down the machine");
@@ -162,6 +163,9 @@ pub fn exec(line: &str) -> bool {
             }
             _ => println!("usage: cap <net|vault>"),
         },
+        "el0test" => {
+            crate::isolation::run_el0_probe();
+        }
         "wipe" => {
             syscall::sys_wipe();
         }

@@ -130,7 +130,7 @@ el1h_sync:
 lower64_sync:
     SAVE_CTX
     mov     x0, sp
-    bl      rust_sync_handler
+    bl      rust_lower_sync_handler
     mov     sp, x0
     RESTORE_CTX
     eret
@@ -210,6 +210,21 @@ extern "C" fn rust_sync_handler(sp: usize) -> usize {
         syscall::dispatch(sp)
     } else {
         rust_fault_handler(sp, 3)
+    }
+}
+
+/// Synchronous exceptions taken from a lower EL (EL0). An SVC is a syscall; any
+/// other synchronous fault (a data or instruction abort) is an EL0 task touching
+/// memory it is not allowed to. The latter is reported and recovered from rather
+/// than halting the machine, so a misbehaving user task cannot take Aurora down.
+#[no_mangle]
+extern "C" fn rust_lower_sync_handler(sp: usize) -> usize {
+    let esr = esr_el1();
+    let ec = esr >> 26;
+    if ec == 0b010101 {
+        syscall::dispatch(sp)
+    } else {
+        crate::isolation::handle_el0_fault(esr, far_el1())
     }
 }
 

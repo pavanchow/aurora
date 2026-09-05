@@ -55,6 +55,14 @@ SECTIONS
     . = . + 0x02000000;        /* 32 MiB frame pool */
     __frames_end = .;
 
+    /* Dedicated EL0 user region, 2 MiB aligned and 2 MiB in size so exactly one
+       level-2 entry can be refined into a page table without touching any kernel
+       mapping. Page 0 is the user code page, page 1 the user stack. */
+    . = ALIGN(0x200000);
+    __user_start = .;
+    . = . + 0x00200000;        /* 2 MiB user region */
+    __user_end = .;
+
     /DISCARD/ : {
         *(.comment)
         *(.note .note.*)

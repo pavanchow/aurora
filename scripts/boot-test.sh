@@ -146,6 +146,12 @@ require "compute arg 6*7-1"        "-> 41"
 require "primes below 1000 sum"    "76127"
 require "561 Carmichael verdict"   "561 is a Carmichael number"
 
+# EL0 isolation: a user task makes a legit syscall, then faults trying to read
+# the vault directly, and the kernel recovers instead of halting.
+require "EL0 legit syscall works"  "EL0 user task ran a legit 'write' syscall"
+require "EL0 faults on vault"      "EL0 fault: data abort"
+require "EL0 access denied"        "DENIED: EL0 cannot read kernel/vault RAM"
+
 require "clean shutdown"         "[shutdown] powering off"
 
 # No crashes, and the amnesia proof must not have failed.

@@ -27,11 +27,16 @@ const AF: u64 = 1 << 10; // access flag
 const SH_INNER: u64 = 0b11 << 8; // inner shareable
 const SH_NONE: u64 = 0b00 << 8;
 const AP_RW_EL1: u64 = 0b00 << 6; // read/write at EL1, no EL0
+const AP_RW_ALL: u64 = 0b01 << 6; // read/write at EL1 and EL0
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 
 // Output-address mask for a level-1 1 GiB block: PA[47:30].
 const OA_1G_MASK: u64 = 0x0000_FFFF_C000_0000;
+// Output-address mask for a level-2 2 MiB block: PA[47:21].
+const OA_2M_MASK: u64 = 0x0000_FFFF_FFE0_0000;
+// Next-level table / 4 KiB page output address: PA[47:12].
+const ADDR_4K_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// Level-1 table index (bits [38:30]).
 #[inline]
@@ -59,6 +64,37 @@ pub const fn block_1g(pa: usize, device: bool) -> u64 {
         d |= SH_NONE | (ATTR_DEVICE << 2) | PXN | UXN;
     } else {
         d |= SH_INNER | (ATTR_NORMAL << 2);
+    }
+    d
+}
+
+/// Build a level-2 2 MiB block descriptor mapping VA->`pa` as normal cacheable
+/// RAM. `el0` grants EL0 read/write (else EL1-only). Kernel-executable at EL1
+/// (PXN clear) but never at EL0 (UXN set): EL0 code runs from 4 KiB pages.
+pub const fn block_2m(pa: usize, el0: bool) -> u64 {
+    let mut d = ((pa as u64) & OA_2M_MASK) | AF | BLOCK | VALID | SH_INNER | (ATTR_NORMAL << 2);
+    d |= if el0 { AP_RW_ALL } else { AP_RW_EL1 };
+    d |= UXN;
+    d
+}
+
+/// Build a table descriptor pointing at the next-level table at `pa`.
+pub const fn table_desc(pa: usize) -> u64 {
+    ((pa as u64) & ADDR_4K_MASK) | TABLE | VALID
+}
+
+/// Build a level-3 4 KiB page descriptor mapping VA->`pa` as normal cacheable
+/// RAM. `el0` grants EL0 read/write. `exec` (only meaningful with `el0`) makes
+/// the page EL0-executable (UXN clear) while keeping it non-executable at EL1
+/// (PXN set); a non-exec page is execute-never at both levels.
+pub const fn page_4k(pa: usize, el0: bool, exec: bool) -> u64 {
+    // At level 3 a page descriptor's low bits are 0b11 (TABLE | VALID).
+    let mut d = ((pa as u64) & ADDR_4K_MASK) | AF | SH_INNER | (ATTR_NORMAL << 2) | TABLE | VALID;
+    d |= if el0 { AP_RW_ALL } else { AP_RW_EL1 };
+    if el0 && exec {
+        d |= PXN; // EL0 may execute (UXN clear); EL1 may not (PXN set).
+    } else {
+        d |= UXN | PXN; // no execution at either level.
     }
     d
 }
@@ -141,6 +177,34 @@ mod tests {
         assert_ne!(d & PXN, 0, "device memory must be PXN");
         assert_ne!(d & UXN, 0, "device memory must be UXN");
         assert_eq!((d >> 8) & 0b11, 0b00, "device is non-shareable");
+    }
+
+    #[test]
+    fn el0_user_pages_have_expected_permissions() {
+        // A 2 MiB kernel block is EL1-only (AP=00) and EL0-non-executable (UXN).
+        let k = block_2m(0x4020_0000, false);
+        assert!(is_valid(k));
+        assert_eq!((k >> 6) & 0b11, 0b00, "kernel block is EL1-only");
+        assert_ne!(k & UXN, 0, "kernel block is EL0 non-executable");
+
+        // A user code page is EL0 read/write (AP=01) and EL0-executable (UXN
+        // clear) but kernel-non-executable (PXN set).
+        let code = page_4k(0x4260_0000, true, true);
+        assert_eq!((code >> 6) & 0b11, 0b01, "user code page is EL0-accessible");
+        assert_eq!(code & UXN, 0, "user code page is EL0-executable");
+        assert_ne!(code & PXN, 0, "user code page is kernel-non-executable");
+        assert_eq!(code & 0b11, 0b11, "level-3 page descriptor low bits");
+
+        // A user data/stack page is EL0 read/write but execute-never everywhere.
+        let stack = page_4k(0x4260_1000, true, false);
+        assert_eq!((stack >> 6) & 0b11, 0b01, "user stack is EL0-accessible");
+        assert_ne!(stack & UXN, 0, "user stack is EL0 non-executable");
+        assert_ne!(stack & PXN, 0, "user stack is kernel-non-executable");
+
+        // A table descriptor carries the aligned next-level address and is valid.
+        let t = table_desc(0x4270_0000);
+        assert_eq!(t & 0b11, 0b11, "table descriptor low bits");
+        assert_eq!((t & ADDR_4K_MASK) as usize, 0x4270_0000);
     }
 
     #[test]

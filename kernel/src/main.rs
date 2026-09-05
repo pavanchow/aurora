@@ -19,6 +19,7 @@ mod exceptions;
 mod frame_alloc;
 mod gic;
 mod heap;
+mod isolation;
 mod kindling;
 mod mem;
 mod mmu;
@@ -99,6 +100,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // The headline: prove a full agent session runs and leaves RAM clean.
     let _ = amnesia::prove();
+
+    // Prove the EL0/EL1 hardware boundary: a user task faults on kernel RAM.
+    isolation::run_el0_probe();
 
     // Hand off to the interactive shell. In headless boot tests, commands are
     // piped in over the UART and the `exit` command powers the machine off.
