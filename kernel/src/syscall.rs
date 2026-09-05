@@ -20,6 +20,7 @@ pub const SYS_RUN_TASK: u64 = 6;
 pub const SYS_MSG_SEND: u64 = 7;
 pub const SYS_MSG_RECV: u64 = 8;
 pub const SYS_REQUEST_CAP: u64 = 9;
+pub const SYS_COMPUTE: u64 = 10;
 
 /// Dispatch a syscall from the trap frame at `sp`. Returns the stack pointer to
 /// restore (unchanged, except for `yield`/`exit` which switch tasks).
@@ -87,6 +88,11 @@ pub fn dispatch(sp: usize) -> usize {
         }
         SYS_REQUEST_CAP => {
             frame.x[0] = session::request_capability(frame.x[0] as u32) as u64;
+            sp
+        }
+        SYS_COMPUTE => {
+            let src = str_arg(frame.x[0], frame.x[1]);
+            frame.x[0] = session::compute(src) as u64;
             sp
         }
         _ => {
@@ -160,6 +166,20 @@ pub fn sys_run_task(name: &str) -> bool {
             in("x8") SYS_RUN_TASK,
             inout("x0") name.as_ptr() as u64 => ret,
             in("x1") name.len(),
+            options(nostack),
+        );
+    }
+    ret != 0
+}
+
+pub fn sys_compute(src: &str) -> bool {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_COMPUTE,
+            inout("x0") src.as_ptr() as u64 => ret,
+            in("x1") src.len(),
             options(nostack),
         );
     }

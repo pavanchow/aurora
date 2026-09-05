@@ -10,7 +10,11 @@
 
 use crate::sync::SpinLock;
 use crate::vault::{Vault, MAX_VAL};
-use crate::{entropy, mem, print, println};
+use crate::{entropy, kindling, mem, print, println};
+
+/// Hard cap on Kindling instructions per compute run: a runaway agent program
+/// cannot hang the single-core kernel, it traps with a step-limit error instead.
+const COMPUTE_STEP_LIMIT: u64 = 50_000_000;
 
 // Capabilities an agent session can hold. CAP_NET is never granted: Aurora has
 // no network path, and the point is trace-free local work.
@@ -249,11 +253,15 @@ pub fn run_task(name: &str) -> bool {
         println!("[agent] denied: start a session first");
         return false;
     }
-    println!("[agent] run '{}'", name);
+    // The task name may carry an argument, e.g. "sum 1000".
+    let mut toks = name.split_whitespace();
+    let task = toks.next().unwrap_or("");
+    let arg = toks.next();
+    println!("[agent] run '{}'", task);
     // All task working memory lives in this scratch buffer, scrubbed on the way
     // out so the task leaves nothing behind.
     let mut scratch = [0u8; 256];
-    let known = match name {
+    let known = match task {
         "hello" => {
             let s = b"hello from an ephemeral agent task";
             scratch[..s.len()].copy_from_slice(s);
@@ -261,12 +269,14 @@ pub fn run_task(name: &str) -> bool {
             true
         }
         "sum" => {
+            // Parameterized: `run sum <n>` sums 1..=n (defaults to 100).
+            let n: u64 = arg.and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut acc: u64 = 0;
-            for i in 1..=100u64 {
-                acc += i;
+            for i in 1..=n {
+                acc = acc.wrapping_add(i);
             }
             scratch[..8].copy_from_slice(&acc.to_le_bytes());
-            println!("  -> sum(1..=100) = {}", acc);
+            println!("  -> sum(1..={}) = {}", n, acc);
             true
         }
         "vault-demo" => {
@@ -296,9 +306,73 @@ pub fn run_task(name: &str) -> bool {
         *b = 0;
     }
     if known {
-        println!("[agent] task '{}' done, scratch scrubbed", name);
+        println!("[agent] task '{}' done, scratch scrubbed", task);
     }
     known
+}
+
+/// Run a Kindling program inside the current session, gated by CAP_COMPUTE.
+/// This is Aurora's general in-OS compute surface: a from-scratch sandboxed
+/// bytecode interpreter with no file, network, or system access. Its output is
+/// printed and its final produced value is shown. The program text is staged in
+/// a session scratch buffer that is scrubbed on the way out.
+pub fn compute(src: &str) -> bool {
+    if !has_cap(CAP_COMPUTE) {
+        println!("[compute] denied: session inactive or missing CAP_COMPUTE");
+        return false;
+    }
+    // Convenience: a bare expression like `compute 40 + 2` is not a valid
+    // statement on its own, so terminate it with `;` when the source does not
+    // already end in a statement terminator. Multi-line programs (ending in `;`
+    // or `}`) are left untouched.
+    let trimmed = src.trim();
+    let needs_semi = !trimmed.is_empty()
+        && !trimmed.ends_with(';')
+        && !trimmed.ends_with('}');
+    let owned;
+    let effective: &str = if needs_semi {
+        owned = alloc::format!("{};", trimmed);
+        &owned
+    } else {
+        src
+    };
+    println!(
+        "[compute] running {} bytes of Kindling in-session (CAP_COMPUTE, sandboxed, RAM-only)",
+        effective.len()
+    );
+    let ok = match kindling::run_source(effective, COMPUTE_STEP_LIMIT) {
+        Ok(r) => {
+            if !r.output.is_empty() {
+                // Program `print` output, verbatim.
+                print!("{}", r.output);
+            }
+            println!("  -> {}", kindling::outcome_str(&r.value));
+            true
+        }
+        Err(e) => {
+            println!("[compute] error: {}", e);
+            false
+        }
+    };
+    // No-trace teardown: scrub the compute scratch. The interpreter's dynamic
+    // values live on the kernel heap (freed on drop of the RunResult above); the
+    // heap, like the live kernel stack, is scrubbed by a full `wipe`.
+    scrub_compute_scratch();
+    if ok {
+        println!("[compute] done, scratch scrubbed");
+    }
+    ok
+}
+
+/// Zero a small stack scratch used while marshalling a compute request, so no
+/// fragment of the program text lingers in a stale stack frame.
+#[inline(never)]
+fn scrub_compute_scratch() {
+    let mut scratch = [0u8; 256];
+    for b in scratch.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    core::hint::black_box(&scratch);
 }
 
 // --- teardown / wipe seams (called by `wipe`) --------------------------------

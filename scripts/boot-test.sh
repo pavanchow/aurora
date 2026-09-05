@@ -50,7 +50,37 @@ OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
 info "[2/3] booting in QEMU (timeout ${TIMEOUT_SECS}s)"
-printf 'help\nsession start\nvault put api-key s3cr3t-token-value\nvault get api-key\nrun hello\nrun sum\nvault list\nwipe\nps\nuptime\nmem\necho hello from aurora\nexit\n' | \
+
+# The scripted UART session. Built line by line so the multi-line Kindling
+# `compute` program (ended by a lone '.') and its literal '%' operators survive.
+shell_script() {
+    printf 'help\n'
+    printf 'session start\n'
+    printf 'vault put api-key s3cr3t-token-value\n'
+    printf 'vault get api-key\n'
+    printf 'run hello\n'
+    printf 'run sum 1000\n'
+    printf 'vault list\n'
+    # Parameterized compute: two different inputs -> two different outputs.
+    printf 'compute 40 + 2\n'
+    printf 'compute 6 * 7 - 1\n'
+    # Multi-line Kindling program: sum of primes below 1000 (=76127), then
+    # factor 561 and check Korselt's criterion (Carmichael number).
+    printf 'compute\n'
+    printf 'fn isprime(n){ if(n<2){return false;} let i=2; while(i*i<=n){ if(n%%i==0){return false;} i=i+1; } return true; }\n'
+    printf 'let s=0; let k=2; while(k<1000){ if(isprime(k)){ s=s+k; } k=k+1; } print s;\n'
+    printf 'let n=561; let carm=1; if(isprime(n)){carm=0;}\n'
+    printf 'let m=n; let p=2; while(p<=m){ if(m%%p==0){ print p; let e=0; while(m%%p==0){m=m/p; e=e+1;} if(e>1){carm=0;} if((n-1)%%(p-1)!=0){carm=0;} } p=p+1; }\n'
+    printf 'if(carm==1){ print "561 is a Carmichael number"; } else { print "561 is NOT Carmichael"; }\n'
+    printf '.\n'
+    printf 'wipe\n'
+    printf 'ps\n'
+    printf 'uptime\n'
+    printf 'mem\n'
+    printf 'echo hello from aurora\n'
+    printf 'exit\n'
+}
+shell_script | \
     run_with_timeout "$TIMEOUT_SECS" \
         "$QEMU" -M virt -cpu cortex-a72 -m 512 -nographic -semihosting \
         -kernel "$ELF" >"$OUT" 2>&1
@@ -65,7 +95,7 @@ info "[3/3] asserting boot markers"
 FAIL=0
 
 require() { # description, pattern
-    if grep -qF "$2" "$OUT"; then
+    if grep -qF -- "$2" "$OUT"; then
         green "  ok   $1"
     else
         red   "  MISS $1  (expected to find: $2)"
@@ -101,6 +131,14 @@ require "wipe measured"          "[wipe] scrubbed"
 require "wipe timed in cycles"   "cycles"
 require "no persistence"         "durable writes this session: 0"
 require "AMNESIA PROOF"          "[amnesia] PASS: session RAM is clean"
+
+# Compute: the embedded Kindling interpreter, gated by CAP_COMPUTE.
+require "compute runs in-session"  "of Kindling in-session (CAP_COMPUTE"
+require "parameterized run sum"    "sum(1..=1000) = 500500"
+require "compute arg 40+2"         "-> 42"
+require "compute arg 6*7-1"        "-> 41"
+require "primes below 1000 sum"    "76127"
+require "561 Carmichael verdict"   "561 is a Carmichael number"
 
 require "clean shutdown"         "[shutdown] powering off"
 

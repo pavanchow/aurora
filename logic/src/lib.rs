@@ -23,3 +23,34 @@ pub mod ptable;
 
 #[path = "../../kernel/src/runqueue.rs"]
 pub mod runqueue;
+
+// The embedded Kindling bytecode runtime, mounted from the exact kernel source
+// so `cargo test` exercises the same interpreter the kernel runs. `alloc` is
+// available on the host and the vendored modules use `alloc::` paths.
+extern crate alloc;
+
+#[path = "../../kernel/src/kindling/mod.rs"]
+pub mod kindling;
+
+/// A host-only tree-walking reference interpreter plus a random program
+/// generator, used to differentially test the bytecode VM.
+pub mod kref;
+
+use kindling::Outcome;
+
+/// Compile and run a Kindling program on the bytecode VM, returning the produced
+/// value and anything it printed.
+pub fn run_kindling(src: &str) -> Result<(Outcome, String), String> {
+    let r = kindling::run_source(src, u64::MAX)?;
+    Ok((r.value, r.output))
+}
+
+/// Evaluate a Kindling program with the independent tree-walking reference
+/// interpreter, returning the produced value and anything it printed.
+pub fn eval_reference(src: &str) -> Result<(Outcome, String), String> {
+    let tokens = kindling::lexer::tokenize(src)?;
+    let ast = kindling::parser::parse(tokens)?;
+    let mut interp = kref::interp::Interp::new();
+    let value = interp.run(&ast)?;
+    Ok((kref::interp::to_outcome(&value), interp.take_output()))
+}

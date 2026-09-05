@@ -19,6 +19,7 @@ mod exceptions;
 mod frame_alloc;
 mod gic;
 mod heap;
+mod kindling;
 mod mem;
 mod mmu;
 mod persistence;
