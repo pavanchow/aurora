@@ -2,11 +2,846 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>aurora</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aurora - kernel simulator playground</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --panel-2: #fbfbfd;
+    --text: #1d1d1f;
+    --muted: #6e6e73;
+    --border: #d2d2d7;
+    --accent: #0071e3;
+    --accent-soft: #e8f1fe;
+    --run: #34c759;
+    --blocked: #ff9f0a;
+    --fault: #ff3b30;
+    --evict: #af52de;
+    --idle: #c7c7cc;
+    --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 8px 24px rgba(0,0,0,0.05);
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The dark override MUST come after the base body rule and must re-declare
+     both the variables and the body background, otherwise dark Chrome renders
+     dark text on a white body. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --panel: #1c1c1e;
+      --panel-2: #2c2c2e;
+      --text: #f5f5f7;
+      --muted: #98989d;
+      --border: #38383a;
+      --accent: #0a84ff;
+      --accent-soft: #0a2540;
+      --run: #30d158;
+      --blocked: #ff9f0a;
+      --fault: #ff453a;
+      --evict: #bf5af2;
+      --idle: #48484a;
+      --shadow: 0 1px 3px rgba(0,0,0,0.5), 0 8px 24px rgba(0,0,0,0.4);
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+    }
+  }
+
+  header {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 48px 24px 8px;
+  }
+  header h1 {
+    font-size: 40px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 6px;
+  }
+  header p.tag {
+    font-size: 19px;
+    color: var(--muted);
+    margin: 0 0 4px;
+    max-width: 720px;
+  }
+  header p.note {
+    font-size: 14px;
+    color: var(--muted);
+    margin: 10px 0 0;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 16px 24px 80px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 20px;
+    margin: 16px 0;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 0 0 14px;
+    font-weight: 600;
+  }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 14px;
+    align-items: end;
+  }
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+  select, input {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--sans);
+  }
+  input[type=number] { font-family: var(--mono); }
+
+  .btnrow { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+  button {
+    border: none;
+    border-radius: 980px;
+    padding: 9px 18px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: var(--sans);
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    transition: transform 0.05s ease, filter 0.15s ease;
+  }
+  button:hover { filter: brightness(0.97); }
+  button:active { transform: scale(0.97); }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  button.ghost { background: transparent; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 24px; }
+  .stat { min-width: 90px; }
+  .stat .v { font-size: 26px; font-weight: 700; font-family: var(--mono); letter-spacing: -0.01em; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+
+  .gantt { overflow-x: auto; font-family: var(--mono); font-size: 12px; }
+  .grow { display: grid; grid-auto-flow: column; grid-auto-columns: 16px; gap: 2px; margin: 2px 0; }
+  .glabel { display: flex; align-items: center; }
+  .grid-row { display: grid; grid-template-columns: 90px 1fr; gap: 10px; align-items: center; margin-bottom: 3px; }
+  .cell { width: 16px; height: 16px; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--border); }
+  .cell.run { background: var(--run); border-color: transparent; }
+  .cell.idle { background: var(--idle); border-color: transparent; }
+  .axis { font-size: 10px; color: var(--muted); }
+
+  .queues { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .chip {
+    display: inline-block; padding: 3px 10px; border-radius: 980px;
+    background: var(--accent-soft); color: var(--accent); font-size: 12px;
+    font-family: var(--mono); margin: 3px 4px 3px 0;
+  }
+  .chip.blk { background: rgba(255,159,10,0.16); color: var(--blocked); }
+
+  .frames { display: flex; flex-wrap: wrap; gap: 10px; }
+  .frame {
+    width: 92px; height: 64px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel-2); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; font-family: var(--mono); font-size: 12px;
+    transition: background 0.2s ease, border-color 0.2s ease;
+  }
+  .frame .fi { font-size: 10px; color: var(--muted); }
+  .frame.used { background: var(--accent-soft); border-color: var(--accent); }
+  .frame.fault { background: rgba(255,59,48,0.18); border-color: var(--fault); }
+  .frame.evict { background: rgba(175,82,222,0.18); border-color: var(--evict); }
+  .frame.free { color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); font-family: var(--mono); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .log { max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 12px; }
+  .log div { padding: 2px 0; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .log .blk { color: var(--blocked); }
+  .log .ex { color: var(--fault); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  ol.howto { padding-left: 20px; }
+  ol.howto li { margin: 8px 0; }
+  .howto code { font-family: var(--mono); background: var(--panel-2); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two, .queues { grid-template-columns: 1fr; } }
+  .tourbox { background: var(--accent-soft); border: 1px solid var(--accent); color: var(--text); border-radius: 12px; padding: 14px 16px; font-size: 14px; min-height: 24px; }
+</style>
 </head>
 <body>
-<h1>aurora</h1>
-<p>Site coming soon.</p>
-<p><a href="https://github.com/pavanchow/aurora">View repository</a></p>
+<header>
+  <h1>Aurora</h1>
+  <p class="tag">A deterministic operating-system kernel simulator you can step through in the browser. Spawn processes, choose a scheduler, and watch scheduling, virtual memory and syscalls unfold tick by tick.</p>
+  <p class="note">This is a teaching-accurate model of kernel mechanics, not a bootable operating system. It reimplements the same model as the Rust engine. Source and the full engine at <a href="https://github.com/pavanchow/aurora">github.com/pavanchow/aurora</a>.</p>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Guided tour</h2>
+    <div class="tourbox" id="tour">Press <b>Load demo</b> to fill in three processes, then press <b>Step</b> a few times and watch the timeline grow.</div>
+    <div class="btnrow">
+      <button class="ghost" id="tourPrev">Back</button>
+      <button class="ghost" id="tourNext">Next tip</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Controls</h2>
+    <div class="controls">
+      <div>
+        <label for="policy">Scheduler policy</label>
+        <select id="policy">
+          <option value="mlfq">MLFQ (feedback queue)</option>
+          <option value="rr">Round robin</option>
+          <option value="priority">Priority + aging</option>
+        </select>
+      </div>
+      <div>
+        <label for="quantum">RR quantum (ticks)</label>
+        <input type="number" id="quantum" value="3" min="1" max="12">
+      </div>
+      <div>
+        <label for="replace">Page replacement</label>
+        <select id="replace">
+          <option value="lru">LRU</option>
+          <option value="fifo">FIFO</option>
+          <option value="clock">Clock</option>
+        </select>
+      </div>
+      <div>
+        <label for="frames">Physical frames</label>
+        <input type="number" id="frames" value="4" min="1" max="12">
+      </div>
+    </div>
+
+    <div class="controls" style="margin-top:16px;">
+      <div>
+        <label for="pname">New process name</label>
+        <input type="text" id="pname" value="proc">
+      </div>
+      <div>
+        <label for="pprio">Priority (lower = urgent)</label>
+        <input type="number" id="pprio" value="1" min="0" max="9">
+      </div>
+      <div>
+        <label for="pburst">CPU burst (ticks)</label>
+        <input type="number" id="pburst" value="5" min="1" max="30">
+      </div>
+      <div>
+        <label for="ppages">Pages touched</label>
+        <input type="number" id="ppages" value="3" min="0" max="10">
+      </div>
+      <div>
+        <label for="parr">Arrival tick</label>
+        <input type="number" id="parr" value="0" min="0" max="30">
+      </div>
+    </div>
+
+    <div class="btnrow">
+      <button class="primary" id="add">Add process</button>
+      <button id="step">Step</button>
+      <button id="run">Run</button>
+      <button id="demo">Load demo</button>
+      <button class="ghost" id="reset">Reset</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Kernel state</h2>
+    <div class="stats">
+      <div class="stat"><div class="v" id="s-clock">0</div><div class="k">clock (ticks)</div></div>
+      <div class="stat"><div class="v" id="s-cs">0</div><div class="k">context switches</div></div>
+      <div class="stat"><div class="v" id="s-faults">0</div><div class="k">page faults</div></div>
+      <div class="stat"><div class="v" id="s-evict">0</div><div class="k">evictions</div></div>
+      <div class="stat"><div class="v" id="s-done">0/0</div><div class="k">terminated</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Scheduling timeline</h2>
+    <div class="gantt" id="gantt"></div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--run)"></span>on CPU</span>
+      <span><span class="sw" style="background:var(--idle)"></span>idle</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Queues</h2>
+    <div class="queues">
+      <div><div class="k" style="color:var(--muted);font-size:12px;margin-bottom:6px;">Ready</div><div id="q-ready"></div></div>
+      <div><div class="k" style="color:var(--muted);font-size:12px;margin-bottom:6px;">Blocked (sleep / IPC)</div><div id="q-blocked"></div></div>
+    </div>
+  </section>
+
+  <div class="two">
+    <section class="panel">
+      <h2>Physical frames</h2>
+      <div class="frames" id="frames-grid"></div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--accent)"></span>resident</span>
+        <span><span class="sw" style="background:var(--fault)"></span>just faulted in</span>
+        <span><span class="sw" style="background:var(--evict)"></span>just evicted</span>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Process table and page tables</h2>
+      <table id="ptable">
+        <thead><tr><th>proc</th><th>state</th><th>cpu</th><th>wait</th><th>pages (vpn to frame)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Syscall log</h2>
+    <div class="log" id="log"></div>
+  </section>
+
+  <section class="panel">
+    <h2>How to use this playground</h2>
+    <ol class="howto">
+      <li><b>Pick a scheduler.</b> Use <code>Scheduler policy</code>. Round robin gives every process an equal slice of size <code>RR quantum</code>. Priority runs the most urgent first and ages waiters so none starve. MLFQ starts new work at the top queue and demotes CPU-bound work, boosting everyone periodically so nothing starves.</li>
+      <li><b>Size memory.</b> Set <code>Physical frames</code> small (try 3 or 4) so processes compete for frames, and choose a <code>Page replacement</code> policy to see who gets evicted.</li>
+      <li><b>Add processes.</b> Fill <code>name</code>, <code>priority</code> (lower is more urgent), <code>CPU burst</code>, <code>pages touched</code> and <code>arrival tick</code>, then press <code>Add process</code>. Each process interleaves compute with page accesses, so it exercises both the scheduler and the memory system.</li>
+      <li><b>Step or run.</b> Press <code>Step</code> to advance exactly one tick and study every change, or press <code>Run</code> to play until all processes terminate. Press it again to pause.</li>
+      <li><b>Read the timeline.</b> Each row is a process, each column a tick. A green cell means that process held the CPU that tick. The idle row shows ticks where the CPU had no runnable work.</li>
+      <li><b>Watch memory.</b> The frame grid shows which page of which process occupies each physical frame. A red frame just faulted in, a purple flash marks the frame whose page was evicted. The page table column shows each process mapping virtual pages to frames.</li>
+      <li><b>Follow the syscalls.</b> The syscall log lists every sleep, yield, memory map, IPC and file call, and whether the caller continued or blocked.</li>
+      <li><b>Reset.</b> Press <code>Reset</code> to clear everything and start again with new settings.</li>
+    </ol>
+  </section>
+</main>
+
+<script>
+"use strict";
+(function () {
+  // ---- deterministic PRNG (mirrors the Rust splitmix64 idea, 32-bit LCG) ----
+  function makeRng(seed) {
+    let s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  // ---- memory subsystem: per-process page tables, frames, demand paging ----
+  function Memory(numFrames, policy) {
+    this.n = numFrames;
+    this.policy = policy;
+    this.frames = [];               // {owner:{pid,vpn}|null, lastUsed, ref}
+    for (let i = 0; i < numFrames; i++) this.frames.push({ owner: null, lastUsed: 0, ref: false });
+    this.free = [];
+    for (let i = numFrames - 1; i >= 0; i--) this.free.push(i);
+    this.tables = {};               // pid -> { vpn -> {frame, present} }
+    this.backing = {};              // "pid:vpn" -> true (has content)
+    this.fifo = [];
+    this.hand = 0;
+    this.clock = 0;
+    this.faults = 0;
+    this.evictions = 0;
+    this.lastFault = null;          // frame index highlighted
+    this.lastEvict = null;
+  }
+  Memory.prototype.table = function (pid) {
+    if (!this.tables[pid]) this.tables[pid] = {};
+    return this.tables[pid];
+  };
+  Memory.prototype.pickVictim = function () {
+    const isPriv = (f) => this.frames[f].owner !== null;
+    if (this.policy === "fifo") {
+      while (this.fifo.length && !isPriv(this.fifo[0])) this.fifo.shift();
+      if (this.fifo.length) return this.fifo[0];
+    } else if (this.policy === "lru") {
+      let best = -1;
+      for (let i = 0; i < this.n; i++) {
+        if (isPriv(i) && (best < 0 || this.frames[i].lastUsed < this.frames[best].lastUsed)) best = i;
+      }
+      if (best >= 0) return best;
+    } else { // clock
+      for (let k = 0; k < 2 * this.n; k++) {
+        const i = this.hand;
+        this.hand = (this.hand + 1) % this.n;
+        if (isPriv(i)) {
+          if (this.frames[i].ref) this.frames[i].ref = false;
+          else return i;
+        }
+      }
+    }
+    for (let i = 0; i < this.n; i++) if (isPriv(i)) return i;
+    return 0;
+  };
+  Memory.prototype.evict = function (frame) {
+    const o = this.frames[frame].owner;
+    this.backing[o.pid + ":" + o.vpn] = true;
+    const pte = this.table(o.pid)[o.vpn];
+    if (pte) { pte.present = false; pte.frame = null; }
+    this.frames[frame].owner = null;
+    this.evictions++;
+    this.lastEvict = frame;
+    return o;
+  };
+  Memory.prototype.alloc = function () {
+    if (this.free.length) return { frame: this.free.pop(), evicted: null };
+    const v = this.pickVictim();
+    const ev = this.evict(v);
+    return { frame: v, evicted: ev };
+  };
+  Memory.prototype.access = function (pid, vpn, write) {
+    const pte = this.table(pid)[vpn];
+    this.clock++;
+    if (pte && pte.present) {
+      this.frames[pte.frame].lastUsed = this.clock;
+      this.frames[pte.frame].ref = true;
+      this.lastFault = null;
+      return { fault: false, frame: pte.frame, evicted: null };
+    }
+    // page fault
+    const a = this.alloc();
+    this.frames[a.frame] = { owner: { pid: pid, vpn: vpn }, lastUsed: this.clock, ref: true };
+    this.fifo.push(a.frame);
+    this.table(pid)[vpn] = { frame: a.frame, present: true };
+    this.faults++;
+    this.lastFault = a.frame;
+    return { fault: true, frame: a.frame, evicted: a.evicted };
+  };
+  Memory.prototype.liveMappings = function () {
+    const out = [];
+    for (const pid in this.tables) {
+      const t = this.tables[pid];
+      for (const vpn in t) if (t[vpn].present) out.push({ pid: +pid, vpn: +vpn, frame: t[vpn].frame });
+    }
+    return out;
+  };
+
+  // ---- scheduler: one object, three policies ----
+  function Scheduler(policy, quantum) {
+    this.policy = policy;
+    this.quantum = quantum;
+    this.rr = [];
+    this.prio = [];                 // {pid, base, since}
+    this.levels = [[], [], []];
+    this.quanta = [2, 4, 8];
+    this.levelOf = {};
+    this.boostInterval = 16;
+    this.lastBoost = 0;
+  }
+  Scheduler.prototype.name = function () {
+    return this.policy === "rr" ? "round-robin" : this.policy === "priority" ? "priority" : "mlfq";
+  };
+  Scheduler.prototype.admit = function (pid, prio, now) {
+    if (this.policy === "rr") this.rr.push(pid);
+    else if (this.policy === "priority") this.prio.push({ pid: pid, base: prio, since: now });
+    else {
+      if (this.levelOf[pid] === undefined) this.levelOf[pid] = 0;
+      this.levels[this.levelOf[pid]].push(pid);
+    }
+  };
+  Scheduler.prototype.next = function (now) {
+    if (this.policy === "rr") {
+      if (!this.rr.length) return null;
+      return { pid: this.rr.shift(), quantum: this.quantum };
+    } else if (this.policy === "priority") {
+      if (!this.prio.length) return null;
+      const eff = (e) => e.base - Math.floor((now - e.since) / 6);
+      let b = 0;
+      for (let i = 1; i < this.prio.length; i++) {
+        if (eff(this.prio[i]) < eff(this.prio[b]) ||
+           (eff(this.prio[i]) === eff(this.prio[b]) && this.prio[i].since < this.prio[b].since)) b = i;
+      }
+      const e = this.prio.splice(b, 1)[0];
+      return { pid: e.pid, quantum: this.quantum };
+    } else {
+      for (let l = 0; l < this.levels.length; l++) {
+        if (this.levels[l].length) return { pid: this.levels[l].shift(), quantum: this.quanta[l] };
+      }
+      return null;
+    }
+  };
+  Scheduler.prototype.preempt = function (pid, prio, now) {
+    if (this.policy === "mlfq") {
+      this.levelOf[pid] = Math.min((this.levelOf[pid] || 0) + 1, this.levels.length - 1);
+      this.levels[this.levelOf[pid]].push(pid);
+    } else this.admit(pid, prio, now);
+  };
+  Scheduler.prototype.yielded = function (pid, prio, now) { this.admit(pid, prio, now); };
+  Scheduler.prototype.age = function (now) {
+    if (this.policy !== "mlfq") return;
+    if (now - this.lastBoost < this.boostInterval) return;
+    this.lastBoost = now;
+    const moved = [];
+    for (let l = 1; l < this.levels.length; l++) { while (this.levels[l].length) moved.push(this.levels[l].shift()); }
+    for (const pid of moved) { this.levelOf[pid] = 0; this.levels[0].push(pid); }
+    for (const pid in this.levelOf) this.levelOf[pid] = 0;
+  };
+  Scheduler.prototype.readyLen = function () {
+    if (this.policy === "rr") return this.rr.length;
+    if (this.policy === "priority") return this.prio.length;
+    return this.levels.reduce((a, q) => a + q.length, 0);
+  };
+
+  // ---- kernel ----
+  function Kernel(procs, sched, mem) {
+    this.clock = 0;
+    this.procs = procs;             // array of process objects
+    this.sched = sched;
+    this.mem = mem;
+    this.running = null;
+    this.lastRan = null;
+    this.quantumLeft = 0;
+    this.cs = 0;
+    this.timeline = [];             // {pid|null}
+    this.log = [];
+    this.sleepers = [];             // {wake, pid}
+    this.ipcWait = [];
+    this.mailbox = [];              // simple single mailbox queue
+    this.arrivals = procs.map((p) => ({ at: p.arrival, pid: p.pid }))
+                         .sort((a, b) => a.at - b.at || a.pid - b.pid);
+  }
+  Kernel.prototype.allDone = function () { return this.procs.every((p) => p.state === "terminated"); };
+  Kernel.prototype.logline = function (pid, call, outcome) {
+    this.log.push({ tick: this.clock, pid: pid, call: call, outcome: outcome });
+  };
+  Kernel.prototype.runSyscalls = function (p, now) {
+    while (true) {
+      if (p.burstLeft > 0) return "compute";
+      if (p.cursor >= p.program.length) { this.logline(p.pid, "exit", "exited"); return "exited"; }
+      const op = p.program[p.cursor];
+      p.cursor++;
+      if (op.t === "compute") { p.burstLeft = op.n; if (op.n === 0) continue; return "compute"; }
+      if (op.t === "yield") { this.logline(p.pid, "yield", "continue"); return "yielded"; }
+      if (op.t === "sleep") { this.sleepers.push({ wake: now + Math.max(1, op.n), pid: p.pid }); this.logline(p.pid, "sleep", "blocked"); return "blocked"; }
+      if (op.t === "mem") {
+        const r = this.mem.access(p.pid, op.vpn, op.write);
+        this.logline(p.pid, "map v" + op.vpn + (r.fault ? " (fault->f" + r.frame + (r.evicted ? " evict p" + r.evicted.pid + ":v" + r.evicted.vpn : "") + ")" : " (hit)"), "continue");
+      }
+    }
+  };
+  Kernel.prototype.step = function () {
+    const now = this.clock;
+    // arrivals
+    while (this.arrivals.length && this.arrivals[0].at <= now) {
+      const a = this.arrivals.shift();
+      const p = this.procs[a.pid];
+      p.state = "ready";
+      this.sched.admit(p.pid, p.priority, now);
+    }
+    // wake sleepers
+    const woke = [];
+    this.sleepers = this.sleepers.filter((s) => { if (s.wake <= now) { woke.push(s.pid); return false; } return true; });
+    woke.sort((x, y) => x - y);
+    for (const pid of woke) { this.procs[pid].state = "ready"; this.sched.admit(pid, this.procs[pid].priority, now); }
+    this.sched.age(now);
+
+    while (true) {
+      if (this.running === null) {
+        const d = this.sched.next(now);
+        if (!d) { this.timeline.push({ pid: null }); this.chargeWait(null); this.clock++; return; }
+        this.running = d.pid;
+        this.quantumLeft = d.quantum;
+        const p = this.procs[d.pid];
+        p.state = "running";
+        p.dispatches++;
+        if (p.firstRun === null) p.firstRun = now;
+        if (this.lastRan !== d.pid) this.cs++;
+      }
+      const p = this.procs[this.running];
+      const out = this.runSyscalls(p, now);
+      if (out === "exited") { p.state = "terminated"; p.finish = now; this.running = null; continue; }
+      if (out === "blocked") { p.state = "blocked"; this.running = null; continue; }
+      if (out === "yielded") { p.state = "ready"; this.sched.yielded(p.pid, p.priority, now); this.running = null; continue; }
+      // compute
+      p.burstLeft--; p.cpu++; this.quantumLeft--;
+      this.timeline.push({ pid: p.pid });
+      this.chargeWait(p.pid);
+      this.lastRan = p.pid;
+      if (p.burstLeft === 0 && p.cursor >= p.program.length) { p.state = "terminated"; p.finish = now + 1; this.running = null; }
+      else if (this.quantumLeft === 0) { p.state = "ready"; this.sched.preempt(p.pid, p.priority, now + 1); this.running = null; }
+      this.clock++;
+      return;
+    }
+  };
+  Kernel.prototype.chargeWait = function (running) {
+    for (const p of this.procs) if (p.state === "ready" && p.pid !== running) p.wait++;
+  };
+
+  // ---- build processes ----
+  function buildProgram(pid, burst, pages, rng) {
+    const ops = [];
+    const chunks = pages + 1;
+    const per = Math.max(1, Math.floor(burst / chunks));
+    let used = 0;
+    for (let i = 0; i < pages; i++) {
+      ops.push({ t: "mem", vpn: i, write: true });
+      ops.push({ t: "compute", n: per });
+      used += per;
+    }
+    if (burst - used > 0) ops.push({ t: "compute", n: burst - used });
+    if (pages > 0) ops.push({ t: "mem", vpn: 0, write: false }); // re-touch, may reload
+    return ops;
+  }
+
+  // ---- application state ----
+  let defs = [];     // process definitions
+  let kernel = null;
+  let running = false;
+  let timer = null;
+  let rng = makeRng(12345);
+
+  function rebuild() {
+    const frames = clampInt("frames", 1, 12, 4);
+    const quantum = clampInt("quantum", 1, 12, 3);
+    const policy = document.getElementById("policy").value;
+    const replace = document.getElementById("replace").value;
+    const procs = defs.map((d, i) => ({
+      pid: i, name: d.name, priority: d.priority, arrival: d.arrival,
+      program: buildProgram(i, d.burst, d.pages, rng),
+      cursor: 0, burstLeft: 0, cpu: 0, wait: 0, dispatches: 0,
+      firstRun: null, finish: null,
+      state: "blocked"
+    }));
+    kernel = new Kernel(procs, new Scheduler(policy, quantum), new Memory(frames, replace));
+    render();
+  }
+
+  function clampInt(id, lo, hi, dflt) {
+    let v = parseInt(document.getElementById(id).value, 10);
+    if (isNaN(v)) v = dflt;
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function stopRun() { running = false; if (timer) { clearInterval(timer); timer = null; } document.getElementById("run").textContent = "Run"; }
+
+  // ---- rendering ----
+  function render() {
+    if (!kernel) return;
+    document.getElementById("s-clock").textContent = kernel.clock;
+    document.getElementById("s-cs").textContent = kernel.cs;
+    document.getElementById("s-faults").textContent = kernel.mem.faults;
+    document.getElementById("s-evict").textContent = kernel.mem.evictions;
+    const done = kernel.procs.filter((p) => p.state === "terminated").length;
+    document.getElementById("s-done").textContent = done + "/" + kernel.procs.length;
+
+    renderGantt();
+    renderQueues();
+    renderFrames();
+    renderTable();
+    renderLog();
+  }
+
+  function renderGantt() {
+    const g = document.getElementById("gantt");
+    g.innerHTML = "";
+    const rows = kernel.procs.slice();
+    for (const p of rows) {
+      const row = document.createElement("div");
+      row.className = "grid-row";
+      const label = document.createElement("div");
+      label.className = "glabel";
+      label.textContent = p.name;
+      const grow = document.createElement("div");
+      grow.className = "grow";
+      for (const slot of kernel.timeline) {
+        const c = document.createElement("div");
+        c.className = "cell" + (slot.pid === p.pid ? " run" : "");
+        grow.appendChild(c);
+      }
+      row.appendChild(label); row.appendChild(grow);
+      g.appendChild(row);
+    }
+    // idle row
+    const row = document.createElement("div");
+    row.className = "grid-row";
+    const label = document.createElement("div");
+    label.className = "glabel"; label.textContent = "idle";
+    const grow = document.createElement("div");
+    grow.className = "grow";
+    for (const slot of kernel.timeline) {
+      const c = document.createElement("div");
+      c.className = "cell" + (slot.pid === null ? " idle" : "");
+      grow.appendChild(c);
+    }
+    row.appendChild(label); row.appendChild(grow);
+    g.appendChild(row);
+  }
+
+  function renderQueues() {
+    const ready = document.getElementById("q-ready");
+    const blocked = document.getElementById("q-blocked");
+    ready.innerHTML = ""; blocked.innerHTML = "";
+    let anyR = false, anyB = false;
+    for (const p of kernel.procs) {
+      if (p.state === "ready" || p.state === "running") {
+        const c = document.createElement("span");
+        c.className = "chip";
+        c.textContent = p.name + (p.state === "running" ? " (on CPU)" : "");
+        ready.appendChild(c); anyR = true;
+      } else if (p.state === "blocked" && p.firstRun !== null) {
+        const c = document.createElement("span");
+        c.className = "chip blk";
+        c.textContent = p.name;
+        blocked.appendChild(c); anyB = true;
+      }
+    }
+    if (!anyR) ready.innerHTML = '<span style="color:var(--muted);font-size:13px;">empty</span>';
+    if (!anyB) blocked.innerHTML = '<span style="color:var(--muted);font-size:13px;">empty</span>';
+  }
+
+  function renderFrames() {
+    const grid = document.getElementById("frames-grid");
+    grid.innerHTML = "";
+    const m = kernel.mem;
+    for (let i = 0; i < m.n; i++) {
+      const f = document.createElement("div");
+      const owner = m.frames[i].owner;
+      let cls = "frame";
+      if (i === m.lastFault) cls += " fault";
+      else if (i === m.lastEvict && owner) cls += " used";
+      else if (i === m.lastEvict && !owner) cls += " evict";
+      else if (owner) cls += " used";
+      else cls += " free";
+      f.className = cls;
+      if (owner) {
+        f.innerHTML = "<div>p" + owner.pid + " : v" + owner.vpn + "</div><div class='fi'>frame " + i + "</div>";
+      } else {
+        f.innerHTML = "<div>free</div><div class='fi'>frame " + i + "</div>";
+      }
+      grid.appendChild(f);
+    }
+  }
+
+  function renderTable() {
+    const tb = document.querySelector("#ptable tbody");
+    tb.innerHTML = "";
+    for (const p of kernel.procs) {
+      const tr = document.createElement("tr");
+      const t = kernel.mem.tables[p.pid] || {};
+      const maps = Object.keys(t).map((vpn) => "v" + vpn + (t[vpn].present ? "->f" + t[vpn].frame : "->swap"))
+                        .sort().join("  ") || "-";
+      tr.innerHTML = "<td>" + p.name + "</td><td>" + p.state + "</td><td>" + p.cpu +
+                     "</td><td>" + p.wait + "</td><td>" + maps + "</td>";
+      tb.appendChild(tr);
+    }
+  }
+
+  function renderLog() {
+    const l = document.getElementById("log");
+    l.innerHTML = "";
+    const rows = kernel.log.slice(-120);
+    for (const r of rows) {
+      const d = document.createElement("div");
+      if (r.outcome === "blocked") d.className = "blk";
+      if (r.outcome === "exited") d.className = "ex";
+      d.textContent = "t=" + r.tick + "  p" + r.pid + "  " + r.call + "  [" + r.outcome + "]";
+      l.appendChild(d);
+    }
+    l.scrollTop = l.scrollHeight;
+  }
+
+  // ---- guided tour ----
+  const tips = [
+    'Press <b>Load demo</b> to fill in three processes, then press <b>Step</b> a few times and watch the timeline grow.',
+    'Green cells in the timeline mean a process held the CPU that tick. The bottom row shows idle ticks.',
+    'Set <b>Physical frames</b> to 3 and add processes that touch several pages, then step to watch page faults and evictions light up the frame grid.',
+    'Switch <b>Scheduler policy</b> to MLFQ and notice CPU-bound processes sink to longer, lower-priority slices while short jobs stay responsive.',
+    'Try Priority with different priority numbers. Aging means a long-waiting low-priority process eventually runs, so nothing starves.',
+    'Read the syscall log at the bottom: sleep and ipc_recv block the caller, then a later wakeup returns it to the ready queue.'
+  ];
+  let tip = 0;
+  function showTip() { document.getElementById("tour").innerHTML = tips[tip]; }
+
+  // ---- wiring ----
+  function addProcess() {
+    const name = document.getElementById("pname").value || ("proc" + defs.length);
+    defs.push({
+      name: name,
+      priority: clampInt("pprio", 0, 9, 1),
+      burst: clampInt("pburst", 1, 30, 5),
+      pages: clampInt("ppages", 0, 10, 3),
+      arrival: clampInt("parr", 0, 30, 0)
+    });
+    document.getElementById("pname").value = "proc" + defs.length;
+    stopRun();
+    rebuild();
+  }
+
+  function loadDemo() {
+    defs = [
+      { name: "producer", priority: 1, burst: 6, pages: 3, arrival: 0 },
+      { name: "consumer", priority: 0, burst: 5, pages: 2, arrival: 1 },
+      { name: "worker", priority: 2, burst: 9, pages: 4, arrival: 0 }
+    ];
+    document.getElementById("frames").value = 3;
+    document.getElementById("policy").value = "mlfq";
+    stopRun();
+    rebuild();
+  }
+
+  document.getElementById("add").addEventListener("click", addProcess);
+  document.getElementById("demo").addEventListener("click", loadDemo);
+  document.getElementById("reset").addEventListener("click", function () { defs = []; stopRun(); rebuild(); });
+  document.getElementById("step").addEventListener("click", function () {
+    if (!kernel || kernel.procs.length === 0) return;
+    if (!kernel.allDone()) kernel.step();
+    render();
+  });
+  document.getElementById("run").addEventListener("click", function () {
+    if (!kernel || kernel.procs.length === 0) return;
+    if (running) { stopRun(); return; }
+    running = true;
+    this.textContent = "Pause";
+    timer = setInterval(function () {
+      if (!kernel || kernel.allDone()) { stopRun(); render(); return; }
+      kernel.step();
+      render();
+    }, 220);
+  });
+  ["policy", "quantum", "replace", "frames"].forEach(function (id) {
+    document.getElementById(id).addEventListener("change", function () { stopRun(); rebuild(); });
+  });
+  document.getElementById("tourNext").addEventListener("click", function () { tip = (tip + 1) % tips.length; showTip(); });
+  document.getElementById("tourPrev").addEventListener("click", function () { tip = (tip - 1 + tips.length) % tips.length; showTip(); });
+
+  // initial state
+  showTip();
+  rebuild();
+})();
+</script>
 </body>
 </html>
