@@ -5,7 +5,7 @@ target = "aarch64-unknown-none"
 runner = [
     "qemu-system-aarch64",
     "-M", "virt",
-    "-cpu", "cortex-a72",
+    "-cpu", "max",
     "-m", "512",
     "-nographic",
     "-semihosting",

@@ -15,6 +15,17 @@ use crate::crypto::{self, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub const MAX_KEY: usize = 32;
 pub const MAX_VAL: usize = 192;
 
+/// Overwrite a buffer with zeros so a compiler cannot elide the scrub. Used to
+/// wipe transient plaintext staging buffers on the stack the instant a vault
+/// operation finishes, so decrypted secrets never outlive the call on the stack.
+#[inline(never)]
+pub(crate) fn zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 // Record layout in the region: key_len(1) val_len(1) nonce(12) tag(16) key ct.
 const HDR: usize = 1 + 1 + NONCE_LEN + TAG_LEN;
 
@@ -79,9 +90,13 @@ impl<'a> Vault<'a> {
         if ct_out.len() >= ct.len() {
             ct_out[..ct.len()].copy_from_slice(ct);
         }
+        let n = ct.len();
+        // Scrub the staging buffer: it held the plaintext before the in-place
+        // seal, so nothing plaintext (or ciphertext) lingers on the stack.
+        zeroize(&mut buf);
         self.cursor += need;
         self.count += 1;
-        Ok(ct.len())
+        Ok(n)
     }
 
     /// Decrypt the latest value stored under `key_str` into `out`. Returns the
@@ -118,8 +133,11 @@ impl<'a> Vault<'a> {
         buf[..vl].copy_from_slice(&self.region[ct_start..ct_start + vl]);
         if crypto::aead_open(&self.key, &nonce, kb, &mut buf[..vl], &tag) {
             out[..vl].copy_from_slice(&buf[..vl]);
+            // Scrub the decrypted plaintext from the stack staging buffer.
+            zeroize(&mut buf);
             Some(vl)
         } else {
+            zeroize(&mut buf);
             None
         }
     }

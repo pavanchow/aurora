@@ -82,7 +82,7 @@ shell_script() {
 }
 shell_script | \
     run_with_timeout "$TIMEOUT_SECS" \
-        "$QEMU" -M virt -cpu cortex-a72 -m 512 -nographic -semihosting \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
         -kernel "$ELF" >"$OUT" 2>&1
 QEMU_RC=$?
 
@@ -130,7 +130,13 @@ require "agent task ran"         "hello from an ephemeral agent task"
 require "wipe measured"          "[wipe] scrubbed"
 require "wipe timed in cycles"   "cycles"
 require "no persistence"         "durable writes this session: 0"
-require "AMNESIA PROOF"          "[amnesia] PASS: session RAM is clean"
+require "AMNESIA PROOF"          "[amnesia] PASS:"
+
+# Privacy hardening: real entropy source, and the kernel stack is scrubbed so a
+# decrypted vault secret does not survive a wipe on the stack.
+require "hardware entropy source"  "[entropy] source: RNDR (ARMv8.5 hardware RNG)"
+require "wipe covers the stack"    "key+vault+frames+stack"
+require "kernel stack scrubbed"    "post-wipe kernel-stack scan: sentinel plaintext appears 0 times"
 
 # Compute: the embedded Kindling interpreter, gated by CAP_COMPUTE.
 require "compute runs in-session"  "of Kindling in-session (CAP_COMPUTE"

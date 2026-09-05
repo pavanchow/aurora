@@ -115,9 +115,10 @@ pub fn start() -> u64 {
     s.mail.clear();
     let id = s.id;
     println!(
-        "[session] started id={} key=32B (RAM-only, best-effort entropy) caps={:#06b}",
+        "[session] started id={} key=32B (RAM-only) caps={:#06b}",
         id, s.caps
     );
+    println!("[entropy] source: {}", entropy::source_name());
     id
 }
 
@@ -196,7 +197,7 @@ pub fn vault_get(key: &str) -> bool {
         }
     };
     let mut out = [0u8; MAX_VAL];
-    match v.get(key, &mut out) {
+    let found = match v.get(key, &mut out) {
         Some(n) => {
             let text = core::str::from_utf8(&out[..n]).unwrap_or("<binary>");
             println!("[vault] get '{}' -> \"{}\" (decrypted)", key, text);
@@ -206,7 +207,11 @@ pub fn vault_get(key: &str) -> bool {
             println!("[vault] get '{}' -> not found", key);
             false
         }
-    }
+    };
+    // Scrub the decrypted plaintext off the stack the instant it is shown, so a
+    // read secret does not outlive the call on the kernel stack.
+    crate::vault::zeroize(&mut out);
+    found
 }
 
 /// List the keys currently held (names only, values stay encrypted).

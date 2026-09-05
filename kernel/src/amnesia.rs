@@ -12,6 +12,13 @@ use crate::{mem, persistence, println, session, wipe};
 /// A distinctive plaintext marker that must never survive a wipe.
 const SENTINEL: &[u8] = b"AURORA_SENTINEL_DO_NOT_PERSIST_7f3a9c";
 
+#[inline]
+fn sp_now() -> usize {
+    let v: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
 /// Count non-overlapping-safe occurrences of `needle` in `[start, end)`.
 fn scan(start: usize, end: usize, needle: &[u8]) -> u64 {
     let n = needle.len();
@@ -61,6 +68,10 @@ pub fn prove() -> bool {
     session::start();
     let secret = b"AURORA_SENTINEL_DO_NOT_PERSIST_7f3a9c:api-key";
     session::vault_put("agent-secret", secret);
+    // A REAL read: this decrypts the secret into a stack buffer, the exact path
+    // that used to leave plaintext on the kernel stack past a wipe. The fix
+    // scrubs that stack scratch immediately, and the wipe scrubs the free stack.
+    session::vault_get("agent-secret");
 
     // Plant the raw sentinel at the start, middle and end of the frame pool so a
     // partial scrub could not pass unnoticed.
@@ -93,6 +104,18 @@ pub fn prove() -> bool {
         post, scanned
     );
 
+    // Also scan the free part of the kernel stack, below the live frames. This
+    // is where a decrypted vault secret used to survive a wipe. Leave a guard
+    // below SP so we do not read this function's own live frame.
+    let (sb, _st) = mem::stack_region_range();
+    let se = (sp_now().saturating_sub(1024)) & !0xF;
+    let stack_post = if se > sb { scan(sb, se, SENTINEL) } else { 0 };
+    println!(
+        "[amnesia] post-wipe kernel-stack scan: sentinel plaintext appears {} times across {} bytes",
+        stack_post,
+        se.saturating_sub(sb)
+    );
+
     let durable = persistence::durable_writes();
     println!(
         "[persistence] durable writes this session: {} (RAM-only enforced), {} attempt(s) refused",
@@ -100,13 +123,13 @@ pub fn prove() -> bool {
         persistence::refused_attempts()
     );
 
-    let pass = pre > 0 && post == 0 && durable == 0;
+    let pass = pre > 0 && post == 0 && stack_post == 0 && durable == 0;
     if pass {
-        println!("[amnesia] PASS: session RAM is clean, sentinel fully scrubbed, zero durable writes");
+        println!("[amnesia] PASS: session RAM and kernel stack are clean, sentinel fully scrubbed, zero durable writes");
     } else {
         println!(
-            "[amnesia] FAIL: pre={} post={} durable={} (expected pre>0, post=0, durable=0)",
-            pre, post, durable
+            "[amnesia] FAIL: pre={} post={} stack_post={} durable={} (expected pre>0, post=0, stack_post=0, durable=0)",
+            pre, post, stack_post, durable
         );
     }
     pass

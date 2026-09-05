@@ -16,6 +16,8 @@ extern "C" {
     static __frames_end: u8;
     static __vault_start: u8;
     static __vault_end: u8;
+    static __stack_bottom: u8;
+    static __stack_top: u8;
 }
 
 fn sym(p: *const u8) -> usize {
@@ -103,6 +105,13 @@ pub fn frame_pool_range() -> (usize, usize) {
 /// Reserved vault region byte range `[start, end)`.
 pub fn vault_region_range() -> (usize, usize) {
     unsafe { (sym(&__vault_start), sym(&__vault_end)) }
+}
+
+/// Boot/kernel stack byte range `[bottom, top)`. The stack grows down from the
+/// top, so `[bottom, current_sp)` is the free part below the live frames and is
+/// safe to scrub, while `[current_sp, top)` holds the live frames in use.
+pub fn stack_region_range() -> (usize, usize) {
+    unsafe { (sym(&__stack_bottom), sym(&__stack_top)) }
 }
 
 /// The reserved vault region as a mutable static slice. Must be called at most

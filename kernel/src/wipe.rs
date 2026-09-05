@@ -9,11 +9,13 @@
 //! wipe is fast. It is reachable from the `wipe` shell command, the `wipe`
 //! syscall, the kernel panic handler, and normal shutdown.
 //!
-//! Honest scope: this scrubs the RAM Aurora manages as session working memory
-//! (the vault region and the frame pool) plus the key. It does not scrub the
-//! live kernel stack, code, or in-use heap while the kernel is still running on
-//! them. A physical attacker with cold-boot or DMA access is out of scope, see
-//! DESIGN.md.
+//! Scope: this scrubs the RAM Aurora manages as session working memory (the
+//! vault region and the frame pool), the key, and the free part of the kernel
+//! stack below the current stack pointer, where decrypted secrets that transited
+//! a now-returned frame would otherwise linger. It does not scrub the live
+//! frames above the current stack pointer (this wipe's own frames), the code, or
+//! the in-use heap while the kernel is still running on them. A physical attacker
+//! with cold-boot or DMA access is out of scope, see DESIGN.md.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -23,6 +25,13 @@ use crate::{mem, println, session};
 fn cntpct() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+#[inline]
+fn sp_now() -> usize {
+    let v: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) v, options(nomem, nostack)) };
     v
 }
 
@@ -89,15 +98,30 @@ pub fn wipe() -> WipeReport {
     let (fs, fe) = mem::frame_pool_range();
     scrub(fs, fe);
 
-    // 4. Push the zeros past the cache into RAM.
+    // 4. The free part of the kernel stack, below the current stack pointer.
+    // Decrypted vault plaintext and other secrets that transited a now-returned
+    // stack frame live here; the live frames above SP (this wipe's own frames)
+    // are left untouched. Leave a small guard below SP so the scrub loop's own
+    // stack use is never overwritten mid-flight.
+    let (sb, _st) = mem::stack_region_range();
+    let se = (sp_now().saturating_sub(256)) & !0xF;
+    let stack_bytes = se.saturating_sub(sb);
+    if stack_bytes > 0 {
+        scrub(sb, se);
+    }
+
+    // 5. Push the zeros past the cache into RAM.
     clean_invalidate(vs, ve);
     clean_invalidate(fs, fe);
+    if stack_bytes > 0 {
+        clean_invalidate(sb, se);
+    }
 
-    // 5. Forget session metadata.
+    // 6. Forget session metadata.
     session::teardown();
 
     let cycles = cntpct().wrapping_sub(start);
-    let bytes = key_bytes + (ve - vs) + (fe - fs);
+    let bytes = key_bytes + (ve - vs) + (fe - fs) + stack_bytes;
     WipeReport { bytes, cycles, freq_hz: cntfrq() }
 }
 
@@ -105,7 +129,7 @@ pub fn wipe() -> WipeReport {
 pub fn wipe_and_report() -> WipeReport {
     let r = wipe();
     println!(
-        "[wipe] scrubbed {} bytes (key+vault+frames) in {} cycles ({} us at {} Hz), caches flushed",
+        "[wipe] scrubbed {} bytes (key+vault+frames+stack) in {} cycles ({} us at {} Hz), caches flushed",
         r.bytes,
         r.cycles,
         r.micros(),
