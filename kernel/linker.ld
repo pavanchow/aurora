@@ -42,6 +42,13 @@ SECTIONS
     . = . + 0x00100000;        /* 1 MiB boot stack */
     __stack_top = .;
 
+    /* Encrypted session vault: reserved RAM the vault stores records in and the
+       wipe scrubs. Kept in its own region so the amnesia scan can sweep it whole. */
+    . = ALIGN(4096);
+    __vault_start = .;
+    . = . + 0x00100000;        /* 1 MiB vault region */
+    __vault_end = .;
+
     /* Physical frame pool for the frame allocator. */
     . = ALIGN(4096);
     __frames_start = .;

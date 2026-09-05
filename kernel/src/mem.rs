@@ -14,6 +14,8 @@ extern "C" {
     static __heap_end: u8;
     static __frames_start: u8;
     static __frames_end: u8;
+    static __vault_start: u8;
+    static __vault_end: u8;
 }
 
 fn sym(p: *const u8) -> usize {
@@ -89,4 +91,26 @@ pub fn frames_total() -> usize {
 
 pub fn frames_free() -> usize {
     FRAMES.lock().as_ref().map(|f| f.free_frames()).unwrap_or(0)
+}
+
+/// Physical frame pool byte range `[start, end)`. This is scratch RAM the frame
+/// allocator hands out, so the wipe can scrub and the amnesia scan can sweep the
+/// whole region without disturbing live kernel state.
+pub fn frame_pool_range() -> (usize, usize) {
+    unsafe { (sym(&__frames_start), sym(&__frames_end)) }
+}
+
+/// Reserved vault region byte range `[start, end)`.
+pub fn vault_region_range() -> (usize, usize) {
+    unsafe { (sym(&__vault_start), sym(&__vault_end)) }
+}
+
+/// The reserved vault region as a mutable static slice. Must be called at most
+/// once; the returned slice aliases the whole reserved region.
+///
+/// # Safety
+/// The caller must ensure no other reference to the vault region exists.
+pub unsafe fn vault_region_slice() -> &'static mut [u8] {
+    let (start, end) = vault_region_range();
+    core::slice::from_raw_parts_mut(start as *mut u8, end - start)
 }
