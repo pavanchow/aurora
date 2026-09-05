@@ -1,0 +1,18 @@
+[package]
+name = "aurora"
+version = "0.1.0"
+edition = "2021"
+description = "A deterministic operating-system kernel simulator in pure std Rust"
+license = "MIT"
+repository = "https://github.com/pavanchow/aurora"
+
+[[bin]]
+name = "aurora"
+path = "src/bin/aurora.rs"
+
+[lib]
+name = "aurora"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
