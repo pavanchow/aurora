@@ -11,21 +11,28 @@
 
 extern crate alloc;
 
+mod amnesia;
 mod boot;
+mod crypto;
+mod entropy;
 mod exceptions;
 mod frame_alloc;
 mod gic;
 mod heap;
 mod mem;
 mod mmu;
+mod persistence;
 mod ptable;
 mod runqueue;
 mod sched;
+mod session;
 mod shell;
 mod sync;
 mod syscall;
 mod timer;
 mod uart;
+mod vault;
+mod wipe;
 
 use core::panic::PanicInfo;
 
@@ -89,6 +96,9 @@ pub extern "C" fn kernel_main() -> ! {
     let n = syscall::sys_write(b"[syscall] write ok\n");
     println!("[syscall] write returned {}", n);
 
+    // The headline: prove a full agent session runs and leaves RAM clean.
+    let _ = amnesia::prove();
+
     // Hand off to the interactive shell. In headless boot tests, commands are
     // piped in over the UART and the `exit` command powers the machine off.
     println!("\n[shell] interactive console ready. Type 'help'.");
@@ -99,7 +109,7 @@ fn banner() {
     println!();
     println!("======================================================");
     println!("  Aurora aarch64 kernel  (v{})", env!("CARGO_PKG_VERSION"));
-    println!("  a real bootable ARM64 OS on QEMU virt");
+    println!("  Tails for agents: amnesic, encrypted, RAM-only");
     println!("======================================================");
 }
 
@@ -164,6 +174,10 @@ extern "C" fn worker(arg: usize) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\n[panic] {}", info);
+    // A panic is a kill-switch trigger: scrub session RAM before halting so a
+    // crash cannot leave secrets behind.
+    wipe::wipe_and_report();
+    println!("[panic] session RAM wiped, halting");
     loop {
         unsafe { core::arch::asm!("wfe") }
     }

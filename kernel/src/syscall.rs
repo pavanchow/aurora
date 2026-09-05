@@ -8,12 +8,18 @@
 use core::arch::asm;
 
 use crate::exceptions::TrapFrame;
-use crate::{println, sched, timer, uart};
+use crate::{println, sched, session, timer, uart, wipe};
 
 pub const SYS_WRITE: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_GETTIME: u64 = 2;
 pub const SYS_EXIT: u64 = 3;
+pub const SYS_WIPE: u64 = 4;
+pub const SYS_SESSION_START: u64 = 5;
+pub const SYS_RUN_TASK: u64 = 6;
+pub const SYS_MSG_SEND: u64 = 7;
+pub const SYS_MSG_RECV: u64 = 8;
+pub const SYS_REQUEST_CAP: u64 = 9;
 
 /// Dispatch a syscall from the trap frame at `sp`. Returns the stack pointer to
 /// restore (unchanged, except for `yield`/`exit` which switch tasks).
@@ -43,17 +49,56 @@ pub fn dispatch(sp: usize) -> usize {
         SYS_EXIT => {
             let (next_sp, id) = sched::exit_current(sp);
             if id == 0 {
-                // The boot/shell task exiting means the demo is done.
+                // The boot/shell task exiting means the demo is done. Leave no
+                // trace: wipe the session RAM before powering off.
                 println!("[shutdown] powering off (exit code {})", frame.x[0]);
+                wipe::wipe_and_report();
                 shutdown();
             }
             next_sp
+        }
+        SYS_WIPE => {
+            let r = wipe::wipe_and_report();
+            frame.x[0] = r.bytes as u64;
+            sp
+        }
+        SYS_SESSION_START => {
+            frame.x[0] = session::start();
+            sp
+        }
+        SYS_RUN_TASK => {
+            let name = str_arg(frame.x[0], frame.x[1]);
+            frame.x[0] = session::run_task(name) as u64;
+            sp
+        }
+        SYS_MSG_SEND => {
+            let ptr = frame.x[0] as *const u8;
+            let len = frame.x[1] as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            frame.x[0] = session::msg_send(bytes) as u64;
+            sp
+        }
+        SYS_MSG_RECV => {
+            let ptr = frame.x[0] as *mut u8;
+            let cap = frame.x[1] as usize;
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr, cap) };
+            frame.x[0] = session::msg_recv(out).map(|n| n as u64).unwrap_or(u64::MAX);
+            sp
+        }
+        SYS_REQUEST_CAP => {
+            frame.x[0] = session::request_capability(frame.x[0] as u32) as u64;
+            sp
         }
         _ => {
             frame.x[0] = u64::MAX; // ENOSYS
             sp
         }
     }
+}
+
+fn str_arg<'a>(ptr: u64, len: u64) -> &'a str {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    core::str::from_utf8(bytes).unwrap_or("")
 }
 
 // --- User-side wrappers ------------------------------------------------------
@@ -89,6 +134,49 @@ pub fn sys_gettime() -> u64 {
         );
     }
     ret
+}
+
+pub fn sys_wipe() -> usize {
+    let ret: usize;
+    unsafe {
+        asm!("svc #0", in("x8") SYS_WIPE, out("x0") ret, options(nostack));
+    }
+    ret
+}
+
+pub fn sys_session_start() -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!("svc #0", in("x8") SYS_SESSION_START, out("x0") ret, options(nostack));
+    }
+    ret
+}
+
+pub fn sys_run_task(name: &str) -> bool {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_RUN_TASK,
+            inout("x0") name.as_ptr() as u64 => ret,
+            in("x1") name.len(),
+            options(nostack),
+        );
+    }
+    ret != 0
+}
+
+pub fn sys_request_cap(cap: u32) -> bool {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_REQUEST_CAP,
+            inout("x0") cap as u64 => ret,
+            options(nostack),
+        );
+    }
+    ret != 0
 }
 
 pub fn sys_exit(code: u64) -> ! {
