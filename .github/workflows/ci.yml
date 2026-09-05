@@ -3,17 +3,38 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
 jobs:
-  build:
+  host-tests:
+    name: Host unit tests and clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and test
+      - name: Install Rust
         run: |
-          if [ -f Cargo.toml ]; then
-            rustup update stable
-            cargo build --verbose
-            cargo test --verbose
-          else
-            echo "No build configured yet; scaffolding only."
-          fi
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+      - name: Host unit tests (allocators, page tables, scheduler policy, sim)
+        run: cargo test --workspace --verbose
+      - name: Clippy (host crates)
+        run: cargo clippy -p aurora-logic -p aurora -- -D warnings
+
+  boot-test:
+    name: Boot the real kernel in QEMU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and the bare-metal target
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add aarch64-unknown-none
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm
+      - name: Build the kernel (aarch64-unknown-none, release)
+        run: cd kernel && cargo build --release
+      - name: Boot test (correctness gate)
+        run: ./scripts/boot-test.sh
