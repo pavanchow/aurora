@@ -152,9 +152,19 @@ checked against the RFC known-answer test vectors on every `cargo test`. Matchin
 the published vectors is what lets us trust the implementation rather than assert
 it.
 
-The session key is generated per session from a best-effort entropy source, the
-ARM generic timer counter mixed through the cipher. It is kept only in RAM and
-never leaves the machine.
+The session key is generated per session from the best entropy source the machine
+offers. `kernel/src/entropy.rs` checks ID_AA64ISAR0_EL1 for the ARMv8.5 RNG
+extension and, when present, reads the RNDR hardware RNG to fill the key. QEMU
+provides this under `-cpu max`. Only when no hardware RNG exists does it fall back
+to timer-counter jitter diffused through one ChaCha20 block, which is honestly
+labelled best-effort. The source actually used is reported at session start. The
+key is kept only in RAM and never leaves the machine.
+
+Decrypted plaintext is kept off the stack. `vault_put` and `vault_get` stage the
+value in a small stack buffer, and that buffer, together with the session read
+buffer in `session.rs`, is overwritten with volatile zeros the instant the
+operation finishes, so a secret that was read or written does not linger in a
+returned stack frame.
 
 `kernel/src/vault.rs` is the encrypted session store. A `put` takes a key and a
 plaintext value, seals the value under the session key, and stores nonce plus
@@ -172,15 +182,90 @@ completion the session memory and its vault entries are wiped. The agent-oriente
 syscalls are `session_start`, `run_task`, `msg_send`, `msg_recv`,
 `request_capability`, `wipe`, and `exit`.
 
+## In-OS compute: the Kindling interpreter
+
+`kernel/src/kindling/` is a from-scratch dynamically-typed language with a real
+bytecode compiler, a stack virtual machine, and a mark-and-sweep garbage
+collector, vendored into the kernel from the author's Kindling project and adapted
+to `no_std` with the `alloc` crate. It keeps zero external dependencies. Two
+kernel-specific adaptations avoid the libm intrinsics that a bare-metal target
+lacks. Globals use an `alloc::collections::BTreeMap` rather than a hashed map, and
+float formatting and float modulo are computed with core float operations only,
+using integer casts for truncation. The VM and the host reference interpreter
+share these helpers, so the differential test still compares identical semantics.
+
+Compute is exposed as a syscall gated by CAP_COMPUTE and driven from the shell.
+`compute <expr>` runs a one-line program, and a bare `compute` reads lines until a
+lone `.` and runs the whole program. A Kindling program has no file, network, or
+system access, it can only compute and print, which makes it a safe compute
+surface for an untrusted agent. A step limit bounds total executed instructions so
+a runaway program cannot hang the single core. The program text is staged in a
+session scratch buffer that is scrubbed on the way out. This is what lets an agent
+define a function, loop, sum the primes below 1000, or factor a number entirely
+inside the session rather than being limited to a few built-in demos.
+
+The single source of truth is `kernel/src/kindling/`. The `logic` crate includes
+the same files to run the VM unit tests and a differential correctness gate that
+checks the bytecode VM against an independent tree-walking reference interpreter
+over hundreds of random programs plus the two math problems the OS is meant to do.
+
+## EL0 user mode and hardware isolation
+
+`kernel/src/isolation.rs` and the MMU refinement in `kernel/src/mmu.rs` turn the
+capability model into a real hardware boundary for code that runs at EL0. The MMU
+starts from the 1 GiB identity block map, then refines the one 1 GiB block that
+holds a dedicated 2 MiB user region down to a level-2 table of 2 MiB blocks and a
+level-3 table of 4 KiB pages. Every entry keeps the identity mapping and stays
+EL1-only, except the user code page, which is EL0 read and execute, and the user
+stack page, which is EL0 read and write. The vault, the session key, and all other
+kernel RAM are therefore unreachable from EL0.
+
+A small assembly trampoline drops a task to EL0 with its own stack and records a
+recovery point. Synchronous exceptions taken from EL0 route to a dedicated handler.
+An SVC is dispatched as a syscall and returns to EL0 normally, so legitimate
+syscalls work. Any other fault, such as a data abort from touching kernel memory,
+is reported and recovered from by longjmping back into the kernel, so a misbehaving
+user task cannot take the machine down. The boot test drops to EL0, makes a
+legitimate write syscall, then reads the vault directly. The read faults with a
+data abort whose fault address is exactly the vault region, the kernel prints the
+denial, and the machine keeps running.
+
+All EL0 tasks currently share one address space, one TTBR0, so the boundary is
+kernel versus user rather than per-task. That is stated plainly rather than
+overclaimed.
+
+## Connectivity: virtio-net behind CAP_NET
+
+`kernel/src/net.rs` is a from-scratch driver for a modern virtio-mmio virtio-net
+device plus a minimal Ethernet, ARP, IPv4, and ICMP stack. The QEMU runner
+attaches the device with `-netdev user` and `-device virtio-net-device` and forces
+modern virtio-mmio. The driver scans the virtio-mmio slots, resets the device,
+negotiates VIRTIO_F_VERSION_1 and the MAC feature, sets up split receive and
+transmit virtqueues, and posts receive buffers. It polls the used rings rather
+than taking a NIC interrupt, which is all a request and response round trip needs.
+
+On top of the driver, the stack does a genuine round trip over QEMU user-mode
+networking. It sends an ARP request and receives the reply to resolve the gateway,
+then sends an ICMP echo request carrying a token and receives the echo reply with
+the token back. That is an agent sending data out and getting a result in, without
+a human on the UART.
+
+Network access is gated by CAP_NET, which is grantable and revocable rather than a
+hard no. It is off by default, so the trace-free posture holds unless a session
+runs `cap net`, and `cap revoke net` turns it off again.
+
 ## The wipe
 
 `kernel/src/wipe.rs` is the kill switch and the headline feature. A `wipe()` runs
 in a fixed order. It zeros the session key first, so even an interrupted wipe
 loses the ability to decrypt anything. Then it overwrites the vault region with
-zeros. Then it overwrites the physical frame pool with zeros. Then it cleans and
-invalidates the data cache, so the zeros reach memory and no stale ciphertext
-lingers in a cache line. The wipe reads the generic timer counter before and
-after and prints the duration in CPU cycles.
+zeros. Then it overwrites the physical frame pool with zeros. Then it overwrites
+the free part of the kernel stack, the region below the current stack pointer,
+where a decrypted secret from a now-returned frame would otherwise linger. The
+live frames above the stack pointer, the wipe's own frames, are left untouched.
+Then it cleans and invalidates the data cache, so the zeros reach memory and no
+stale ciphertext lingers in a cache line. The wipe reads the generic timer counter
+before and after and prints the duration in CPU cycles.
 
 A wipe can be triggered four ways: the shell `wipe` command, a wipe syscall, a
 kernel panic, and a normal shutdown. Whatever ends the session, the session RAM
@@ -269,8 +354,18 @@ then asserts the markers that can only appear if each subsystem worked:
 - a syscall round-trip marker, which means an `SVC` returned a value,
 - a vault put and get round-trip, which means encryption and decryption worked,
 - "durable writes this session: 0", which means the persistence guard held,
-- the amnesia proof, a planted sentinel that is present before the wipe and
-  scanned to zero occurrences across the vault region and frame pool after it,
+- the amnesia proof, a planted sentinel plus a real vault put and get, present
+  before the wipe and scanned to zero occurrences across the vault region, the
+  frame pool, and the free kernel stack after it,
+- the entropy source line, which reports the hardware RNG in use,
+- a Kindling program running in-session that prints 76127 for the sum of primes
+  below 1000 and confirms 561 is a Carmichael number, plus two parameterized
+  compute calls giving input-dependent results,
+- the EL0 isolation probe, an EL0 task that makes a legitimate syscall and then
+  faults reading the vault directly, with the kernel reporting the denial and
+  continuing,
+- the virtio-net round trip, the NIC negotiating VERSION_1 and coming up, an ARP
+  reply from the gateway, and an ICMP echo reply carrying the sent token back,
 - a clean power-off, which means the machine exited through semihosting.
 
 It also fails on any printed CPU exception or unhandled panic, and it fails if
@@ -288,22 +383,28 @@ durable writes. In-RAM authenticated encryption of vault secrets. A measured RAM
 scrub that zeros the key, then the vault, then the frame pool. A QEMU boot-test
 proof that the sentinel is gone after the wipe.
 
+Now enforced by hardware. The session key comes from the ARMv8.5 RNDR hardware
+RNG when the CPU has one, with the timer fallback only when it does not. Agent
+code can run at EL0 where the vault, the key, and kernel RAM are unreachable and a
+direct access faults to the kernel. The wipe now also scrubs the free kernel stack
+below the current stack pointer, and vault operations zero their plaintext staging
+buffers immediately.
+
 Not solved, and hardware-dependent. True cold-boot and DMA resistance is out of
 scope, a physical attacker with bus access or a cold RAM chip can read memory
 Aurora cannot protect in software. There is no memory-bus or at-rest RAM
 encryption, the CPU sees plaintext in registers and caches during use. There is
 no secure boot or firmware trust.
 
-Best-effort only. The entropy source is the generic timer counter on QEMU, which
-is not a hardware TRNG and is not cryptographically strong. We document it as
-best-effort rather than claim more.
-
-Existing base limits. The kernel runs on a single core, secondary cores are
-parked. It runs EL1-only with no EL0 user mode and no process isolation. It uses
-a 1 GiB identity mapping rather than per-task address spaces. The wipe scrubs the
-managed session RAM, the vault region and frame pool, and the key. It does not
-scrub the live kernel stack, code, or in-use heap while the kernel is still
-running on them.
+Remaining edges, stated plainly. EL0 tasks share one address space, one TTBR0, so
+the boundary is kernel versus user rather than per-task. The EL0 probe's write
+syscall trusts the pointer it is handed, acceptable for the in-tree probe but not
+for untrusted user pointers without bounds checking. Kindling values live on the
+kernel heap during a run, which the wipe covers but which is not zeroed the instant
+a value is dropped. The network stack is polled and does ARP and ICMP only, enough
+for a request and response round trip, not a general socket layer. The wipe does
+not scrub the live kernel stack frames it is running on, the code, or the in-use
+heap. The kernel still runs on a single core with secondary cores parked.
 
 ## The concepts layer
 

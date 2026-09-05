@@ -223,6 +223,17 @@
 
 <main>
   <section class="panel">
+    <h2>What Aurora can do now</h2>
+    <p class="sublabel">Beyond the amnesic core visualized below, the real kernel now also runs a sandboxed in-OS bytecode language, enforces isolation in hardware, and has an opt-in network channel. These run on the metal in QEMU and are proven by the boot test, not shown in this browser model.</p>
+    <div class="stats">
+      <div class="stat"><div class="v">compute</div><div class="k">the embedded Kindling language runs programs in-session under CAP_COMPUTE (it sums the primes below 1000 to 76127 and checks that 561 is a Carmichael number)</div></div>
+      <div class="stat"><div class="v">isolate</div><div class="k">agent code runs at EL0 and faults if it touches the vault or kernel RAM, while legitimate syscalls still work</div></div>
+      <div class="stat"><div class="v">connect</div><div class="k">a from-scratch virtio-net driver does a real ARP and ICMP round trip, gated by a revocable CAP_NET that is off by default</div></div>
+      <div class="stat"><div class="v">harden</div><div class="k">a hardware RNG session key, and the wipe now also scrubs the free kernel stack so decrypted secrets do not survive there</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Session walk-through</h2>
     <div class="stepbox" id="stepbox">
       <div class="st" id="step-tag">Step 1 of 9</div>
@@ -250,7 +261,7 @@
 
   <section class="panel">
     <h2>Session key</h2>
-    <p class="sublabel">Generated per session from a best-effort entropy source (the generic timer counter). Kept only in RAM. It is the first thing zeroed on wipe, so an interrupted wipe still loses the ability to decrypt anything.</p>
+    <p class="sublabel">Generated per session from the ARMv8.5 RNDR hardware RNG when the CPU has one, falling back to timer jitter only when it does not. Kept only in RAM. It is the first thing zeroed on wipe, so an interrupted wipe still loses the ability to decrypt anything.</p>
     <div class="keyrow" id="keyrow"></div>
     <div class="keystate" id="keystate">No session key yet.</div>
   </section>
