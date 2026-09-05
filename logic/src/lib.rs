@@ -21,6 +21,12 @@ pub mod vault;
 #[path = "../../kernel/src/ptable.rs"]
 pub mod ptable;
 
+// The transport-and-resolver wire logic (UDP, DNS, TCP, HTTP), mounted from the
+// exact kernel source so `cargo test` exercises the same encode/parse/checksum
+// code the kernel runs. It is pure (no `asm!`, no MMIO), so it builds on the host.
+#[path = "../../kernel/src/proto.rs"]
+pub mod proto;
+
 #[path = "../../kernel/src/runqueue.rs"]
 pub mod runqueue;
 
