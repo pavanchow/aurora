@@ -59,9 +59,14 @@ throwaway compute.
   which reports it and keeps running, while legitimate syscalls from EL0 still
   work.
 - Offers a revocable network channel. A from-scratch virtio-net driver and a
-  minimal Ethernet, ARP, IPv4, and ICMP stack give an agent a real request and
-  response path, gated by CAP_NET. The capability is off by default and revocable,
-  so the trace-free posture holds unless a session asks for the network.
+  minimal Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, and HTTP/1.0 stack give an
+  agent a real path to pull bytes off the internet, gated by CAP_NET. The `fetch`
+  command resolves a host over DNS, opens a TCP connection, does an HTTP GET, and
+  prints the body. The capability is off by default and revocable, so the
+  trace-free posture holds unless a session asks for the network. Every network
+  buffer, including the fetched body, lives in a reserved region the wipe scrubs,
+  so pulled bytes do not survive a teardown. Limits: one connection at a time,
+  HTTP/1.0 only (no TLS or HTTPS yet), and polled with no congestion control.
 - Tears down without a trace. On session or task exit that session's memory and
   vault are scrubbed, no shell history is retained, and caches are flushed. A full
   session runs and then leaves RAM clean.
@@ -158,9 +163,12 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `vault list`        | list stored secret names (values stay encrypted)    |
 | `cap net`           | grant the revocable network capability              |
 | `cap revoke net`    | revoke the network capability                       |
-| `net <msg>`         | round-trip a message over the network (needs CAP_NET) |
+| `net <msg>`         | ICMP echo round-trip over the network (needs CAP_NET) |
+| `fetch <url>`       | HTTP/1.0 GET `http://host[:port]/path`, print the body (needs CAP_NET) |
+| `resolve <name> [ns]` | live DNS A-record lookup (needs CAP_NET)          |
+| `netamnesia <url>`  | fetch a payload, wipe, prove the bytes are gone     |
 | `el0test`           | run an EL0 user task that must fault on kernel RAM   |
-| `wipe`              | scrub the key, vault, frames, and free stack to zero |
+| `wipe`              | scrub the key, vault, frames, network buffers, and free stack to zero |
 | `panic`             | trigger a panic, which wipes before halting          |
 | `exit`              | wipe and power the machine off cleanly               |
 
@@ -200,7 +208,8 @@ cargo test --workspace
 kernel/     the real no_std aarch64 kernel (boot, MMU, GIC, timer, scheduler, syscalls, vault, wipe, shell)
 kernel/src/kindling/  the embedded from-scratch Kindling bytecode language (compute surface)
 kernel/src/isolation.rs  EL0 user mode and the hardware isolation boundary
-kernel/src/net.rs        the virtio-net driver and the Ethernet/ARP/IPv4/ICMP stack
+kernel/src/net.rs        the virtio-net driver and the Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP stack and fetch
+kernel/src/proto.rs      pure UDP/DNS/TCP/HTTP wire logic (host-tested), no hardware access
 logic/      host crate that re-includes the kernel's pure modules for cargo test (incl. the Kindling differential)
 sim/        the original pure-std kernel simulator (concepts layer)
 scripts/    boot-test.sh, the QEMU boot correctness gate
@@ -224,5 +233,7 @@ probe's write syscall trusts the pointer it is handed, which is fine for the
 in-tree probe but would need bounds checking before running untrusted user
 pointers. Kindling values live on the kernel heap during a run, which the wipe
 covers but which is not zeroed the instant a value is dropped. The network stack
-is polled and does ARP and ICMP only, enough for a request and response round
-trip, not a general socket layer. DESIGN.md states these in full.
+is polled and drives one TCP connection at a time over HTTP/1.0, with no TLS or
+HTTPS, no congestion control, and minimal retransmit, enough to fetch bytes over
+a real handshake rather than a general socket layer. DESIGN.md states these in
+full.

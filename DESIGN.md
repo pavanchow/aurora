@@ -244,11 +244,45 @@ negotiates VIRTIO_F_VERSION_1 and the MAC feature, sets up split receive and
 transmit virtqueues, and posts receive buffers. It polls the used rings rather
 than taking a NIC interrupt, which is all a request and response round trip needs.
 
-On top of the driver, the stack does a genuine round trip over QEMU user-mode
-networking. It sends an ARP request and receives the reply to resolve the gateway,
-then sends an ICMP echo request carrying a token and receives the echo reply with
-the token back. That is an agent sending data out and getting a result in, without
-a human on the UART.
+On top of the driver, the stack layers the transport and resolver an agent needs
+to pull real bytes off the internet. `kernel/src/proto.rs` holds the pure wire
+logic, header build and parse and the Internet checksum for UDP and TCP, the DNS
+A-record query encoder and response parser with name-compression support, and the
+HTTP response parser. It has no hardware access, so the `aurora-logic` crate
+mounts the same source and unit-tests it on the host with known-answer vectors.
+`net.rs` drives the I/O around it.
+
+The layers are:
+
+- ICMP echo, the original round trip. An ARP request resolves the gateway, then an
+  ICMP echo carries a token out and the reply carries it back.
+- UDP and DNS. `resolve` builds an A-record query, sends it to a nameserver over
+  UDP (default 10.0.2.3, the QEMU built-in DNS, overridable), and parses the
+  response, following compression pointers, into an IPv4 address.
+- A one-shot TCP client. It performs the SYN, SYN-ACK, ACK handshake, tracks the
+  send and receive sequence numbers, sends a request, reassembles a segmented
+  response, and closes with a FIN. It supports one active outbound connection at a
+  time and retransmits the SYN and re-ACKs a bounded number of times so a lost
+  packet cannot hang the client forever.
+- An HTTP/1.0 client. Given a host and path it opens TCP to port 80, sends
+  `GET <path> HTTP/1.0` with a Host header and `Connection: close`, reads the
+  status line, headers, and body, and exposes the body.
+- The `fetch` command ties it together: it parses `http://host[:port]/path`,
+  resolves the host over DNS (or takes a dotted IP directly), connects, does the
+  GET, and prints the status and a bounded slice of the body.
+
+Every network buffer, the virtio DMA rings, the per-frame receive scratch, and the
+fetched HTTP body, lives in a dedicated reserved region (`__netbuf_start` to
+`__netbuf_end`, see the linker script and `mem::netbuf_region_range`). The wipe
+scrubs that whole region and marks the NIC down, so fetched bytes never survive a
+teardown and a later network use re-initializes the device cleanly. The boot test
+proves this: it fetches a payload carrying a sentinel, wipes, and asserts the
+sentinel count across the network region is zero.
+
+Honest limits: one TCP connection at a time, HTTP/1.0 only with no TLS or HTTPS,
+polling rather than interrupts, no congestion control, and only minimal
+retransmit. It is enough to fetch bytes over a real handshake, not a general
+socket layer.
 
 Network access is gated by CAP_NET, which is grantable and revocable rather than a
 hard no. It is off by default, so the trace-free posture holds unless a session
@@ -259,9 +293,12 @@ runs `cap net`, and `cap revoke net` turns it off again.
 `kernel/src/wipe.rs` is the kill switch and the headline feature. A `wipe()` runs
 in a fixed order. It zeros the session key first, so even an interrupted wipe
 loses the ability to decrypt anything. Then it overwrites the vault region with
-zeros. Then it overwrites the physical frame pool with zeros. Then it overwrites
-the free part of the kernel stack, the region below the current stack pointer,
-where a decrypted secret from a now-returned frame would otherwise linger. The
+zeros. Then it overwrites the physical frame pool with zeros. Then it marks the
+NIC down and overwrites the network scratch region, the virtio rings and all
+receive buffers and the fetched HTTP body, so no byte pulled off the network
+survives. Then it overwrites the free part of the kernel stack, the region below
+the current stack pointer, where a decrypted secret or fetched byte from a
+now-returned frame would otherwise linger. The
 live frames above the stack pointer, the wipe's own frames, are left untouched.
 Then it cleans and invalidates the data cache, so the zeros reach memory and no
 stale ciphertext lingers in a cache line. The wipe reads the generic timer counter
@@ -366,6 +403,15 @@ then asserts the markers that can only appear if each subsystem worked:
   continuing,
 - the virtio-net round trip, the NIC negotiating VERSION_1 and coming up, an ARP
   reply from the gateway, and an ICMP echo reply carrying the sent token back,
+- the transport and resolver path end to end, a full TCP handshake and HTTP/1.0
+  GET against a local host server the script starts on the fly, returning a known
+  unique payload the test asserts byte for byte, which makes the TCP and HTTP path
+  deterministic without depending on external internet,
+- the amnesia of fetched bytes, a payload with a sentinel fetched into the network
+  buffers, then wiped, then the sentinel scanned to zero across the whole network
+  region,
+- a best-effort live DNS lookup through the built-in nameserver, which prints the
+  A record when online and is not a hard failure when offline,
 - a clean power-off, which means the machine exited through semihosting.
 
 It also fails on any printed CPU exception or unhandled panic, and it fails if
@@ -401,8 +447,10 @@ the boundary is kernel versus user rather than per-task. The EL0 probe's write
 syscall trusts the pointer it is handed, acceptable for the in-tree probe but not
 for untrusted user pointers without bounds checking. Kindling values live on the
 kernel heap during a run, which the wipe covers but which is not zeroed the instant
-a value is dropped. The network stack is polled and does ARP and ICMP only, enough
-for a request and response round trip, not a general socket layer. The wipe does
+a value is dropped. The network stack is polled and drives one TCP connection at a
+time over HTTP/1.0, with no TLS or HTTPS, no congestion control, and only minimal
+retransmit, enough to fetch bytes over a real handshake, not a general socket
+layer. The wipe does
 not scrub the live kernel stack frames it is running on, the code, or the in-use
 heap. The kernel still runs on a single core with secondary cores parked.
 

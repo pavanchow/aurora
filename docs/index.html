@@ -228,7 +228,7 @@
     <div class="stats">
       <div class="stat"><div class="v">compute</div><div class="k">the embedded Kindling language runs programs in-session under CAP_COMPUTE (it sums the primes below 1000 to 76127 and checks that 561 is a Carmichael number)</div></div>
       <div class="stat"><div class="v">isolate</div><div class="k">agent code runs at EL0 and faults if it touches the vault or kernel RAM, while legitimate syscalls still work</div></div>
-      <div class="stat"><div class="v">connect</div><div class="k">a from-scratch virtio-net driver does a real ARP and ICMP round trip, gated by a revocable CAP_NET that is off by default</div></div>
+      <div class="stat"><div class="v">connect</div><div class="k">a from-scratch virtio-net driver plus DNS, TCP, and an HTTP/1.0 client let an agent fetch real bytes over the network, gated by a revocable CAP_NET that is off by default, with every network buffer scrubbed on wipe</div></div>
       <div class="stat"><div class="v">harden</div><div class="k">a hardware RNG session key, and the wipe now also scrubs the free kernel stack so decrypted secrets do not survive there</div></div>
     </div>
   </section>
