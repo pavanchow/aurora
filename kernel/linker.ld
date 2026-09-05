@@ -55,6 +55,15 @@ SECTIONS
     . = . + 0x02000000;        /* 32 MiB frame pool */
     __frames_end = .;
 
+    /* Network session scratch: the virtio-net rings and all DNS/TCP/HTTP receive
+       buffers plus the fetched HTTP body live here, in their own reserved region
+       so the wipe scrubs them whole and the amnesia scan can sweep them. Kept out
+       of .bss so fetched bytes never linger in memory the wipe does not cover. */
+    . = ALIGN(4096);
+    __netbuf_start = .;
+    . = . + 0x00040000;        /* 256 KiB network scratch region */
+    __netbuf_end = .;
+
     /* Dedicated EL0 user region, 2 MiB aligned and 2 MiB in size so exactly one
        level-2 entry can be refined into a page table without touching any kernel
        mapping. Page 0 is the user code page, page 1 the user stack. */

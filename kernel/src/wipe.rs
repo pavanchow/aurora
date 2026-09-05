@@ -10,16 +10,18 @@
 //! syscall, the kernel panic handler, and normal shutdown.
 //!
 //! Scope: this scrubs the RAM Aurora manages as session working memory (the
-//! vault region and the frame pool), the key, and the free part of the kernel
-//! stack below the current stack pointer, where decrypted secrets that transited
-//! a now-returned frame would otherwise linger. It does not scrub the live
+//! vault region, the frame pool, and the network scratch region that holds the
+//! virtio rings, receive buffers, and any fetched HTTP body), the key, and the
+//! free part of the kernel stack below the current stack pointer, where
+//! decrypted secrets or fetched bytes that transited a now-returned frame would
+//! otherwise linger. It does not scrub the live
 //! frames above the current stack pointer (this wipe's own frames), the code, or
 //! the in-use heap while the kernel is still running on them. A physical attacker
 //! with cold-boot or DMA access is out of scope, see DESIGN.md.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use crate::{mem, println, session};
+use crate::{mem, net, println, session};
 
 #[inline]
 fn cntpct() -> u64 {
@@ -98,6 +100,14 @@ pub fn wipe() -> WipeReport {
     let (fs, fe) = mem::frame_pool_range();
     scrub(fs, fe);
 
+    // 3b. The network scratch region: virtio rings, receive buffers, and the
+    // fetched HTTP body, so no byte pulled off the network survives a wipe. The
+    // NIC is marked down first so a later network use re-initializes cleanly
+    // instead of trusting the now-zeroed rings.
+    net::on_wipe();
+    let (ns, ne) = mem::netbuf_region_range();
+    scrub(ns, ne);
+
     // 4. The free part of the kernel stack, below the current stack pointer.
     // Decrypted vault plaintext and other secrets that transited a now-returned
     // stack frame live here; the live frames above SP (this wipe's own frames)
@@ -113,6 +123,7 @@ pub fn wipe() -> WipeReport {
     // 5. Push the zeros past the cache into RAM.
     clean_invalidate(vs, ve);
     clean_invalidate(fs, fe);
+    clean_invalidate(ns, ne);
     if stack_bytes > 0 {
         clean_invalidate(sb, se);
     }
@@ -121,7 +132,7 @@ pub fn wipe() -> WipeReport {
     session::teardown();
 
     let cycles = cntpct().wrapping_sub(start);
-    let bytes = key_bytes + (ve - vs) + (fe - fs) + stack_bytes;
+    let bytes = key_bytes + (ve - vs) + (fe - fs) + (ne - ns) + stack_bytes;
     WipeReport { bytes, cycles, freq_hz: cntfrq() }
 }
 
@@ -129,7 +140,7 @@ pub fn wipe() -> WipeReport {
 pub fn wipe_and_report() -> WipeReport {
     let r = wipe();
     println!(
-        "[wipe] scrubbed {} bytes (key+vault+frames+stack) in {} cycles ({} us at {} Hz), caches flushed",
+        "[wipe] scrubbed {} bytes (key+vault+frames+net+stack) in {} cycles ({} us at {} Hz), caches flushed",
         r.bytes,
         r.cycles,
         r.micros(),

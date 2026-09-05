@@ -18,6 +18,8 @@ extern "C" {
     static __vault_end: u8;
     static __stack_bottom: u8;
     static __stack_top: u8;
+    static __netbuf_start: u8;
+    static __netbuf_end: u8;
 }
 
 fn sym(p: *const u8) -> usize {
@@ -112,6 +114,13 @@ pub fn vault_region_range() -> (usize, usize) {
 /// safe to scrub, while `[current_sp, top)` holds the live frames in use.
 pub fn stack_region_range() -> (usize, usize) {
     unsafe { (sym(&__stack_bottom), sym(&__stack_top)) }
+}
+
+/// Network scratch region byte range `[start, end)`. Holds the virtio-net rings
+/// and all DNS/TCP/HTTP receive buffers plus the fetched body, so the wipe scrubs
+/// them and the amnesia scan can sweep the whole region.
+pub fn netbuf_region_range() -> (usize, usize) {
+    unsafe { (sym(&__netbuf_start), sym(&__netbuf_end)) }
 }
 
 /// The reserved vault region as a mutable static slice. Must be called at most

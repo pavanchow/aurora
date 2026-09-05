@@ -1,25 +1,33 @@
-//! A from-scratch virtio-net driver and a minimal Ethernet / ARP / IPv4 / ICMP
-//! stack: Aurora's revocable workload I/O channel.
+//! A from-scratch virtio-net driver and a minimal network stack: Ethernet, ARP,
+//! IPv4, ICMP, and now the transport and resolver layers an agent needs to pull
+//! real bytes off the internet into the amnesic session: UDP, a DNS resolver, a
+//! one-shot TCP client, and an HTTP/1.0 client behind the `fetch` command.
 //!
 //! The device is a modern (version 2) virtio-mmio virtio-net NIC on the QEMU
 //! `virt` machine, attached with `-netdev user,... -device virtio-net-device`.
 //! The driver brings the device up (reset, feature negotiation for VERSION_1 and
-//! MAC, split virtqueues), then the stack does a real request/response round
-//! trip over QEMU's user-mode network: an ARP request resolves the gateway, and
-//! an ICMP echo carries a token to the gateway and back. That is enough for an
-//! agent to send data out and get a result in without a human on the UART.
+//! MAC, split virtqueues), then the stack does real request/response round trips
+//! over QEMU's user-mode network.
 //!
-//! All of this is gated by CAP_NET, which is off by default and revocable, so the
+//! All of it is gated by CAP_NET, which is off by default and revocable, so the
 //! trace-free posture holds unless a session explicitly asks for the network.
 //!
-//! Zero external crates. Polling only (no NIC IRQ), which is all a request/reply
-//! round trip needs. Cache maintenance is elided because QEMU TCG has no cache
-//! between the CPU and the emulated DMA; barriers order the ring updates.
+//! Amnesia: every network buffer, including the virtio DMA rings, the per-frame
+//! receive scratch, and the fetched HTTP body, lives in the reserved `netbuf`
+//! region (see `mem::netbuf_region_range`). A `wipe` scrubs that whole region, so
+//! fetched bytes never survive a teardown. Pure header build/parse/checksum and
+//! the DNS/HTTP wire logic live in `proto.rs` and are unit-tested on the host.
+//!
+//! Zero external crates. Polling only (no NIC IRQ). Cache maintenance is elided
+//! because QEMU TCG has no cache between the CPU and the emulated DMA; barriers
+//! order the ring updates. Limits: one TCP connection at a time, HTTP/1.0 only
+//! (no TLS/HTTPS), and no congestion control.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use crate::println;
+use crate::proto::{self, DnsResult};
+use crate::{mem, print, println};
 
 // virtio-mmio on QEMU virt: 32 slots, 0x200 bytes apart, from 0x0a00_0000.
 const MMIO_BASE: usize = 0x0a00_0000;
@@ -68,6 +76,9 @@ const QSIZE: usize = 8;
 const BUF_SIZE: usize = 2048;
 const NET_HDR_LEN: usize = 12; // modern virtio_net_hdr
 
+const RX_SCRATCH: usize = 2048; // one received frame at a time
+const BODY_MAX: usize = 32768; // fetched HTTP response cap (headers + body)
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VqDesc {
@@ -107,28 +118,27 @@ struct Queue {
     used: VqUsed,
 }
 
-impl Queue {
-    const fn new() -> Self {
-        Queue {
-            desc: [VqDesc { addr: 0, len: 0, flags: 0, next: 0 }; QSIZE],
-            avail: VqAvail { flags: 0, idx: 0, ring: [0; QSIZE], used_event: 0 },
-            used: VqUsed {
-                flags: 0,
-                idx: 0,
-                ring: [VqUsedElem { id: 0, len: 0 }; QSIZE],
-                avail_event: 0,
-            },
-        }
-    }
-}
-
 #[repr(C, align(4096))]
 struct Buf([u8; BUF_SIZE]);
 
-static mut RXQ: Queue = Queue::new();
-static mut TXQ: Queue = Queue::new();
-static mut RX_BUFS: [Buf; QSIZE] = [const { Buf([0; BUF_SIZE]) }; QSIZE];
-static mut TX_BUF: Buf = Buf([0; BUF_SIZE]);
+/// All network buffers, laid out in the reserved `netbuf` region so a wipe scrubs
+/// them whole. Never a `static`: it is accessed through the fixed region address
+/// so no fetched byte ever lands in memory the wipe does not cover.
+#[repr(C, align(4096))]
+struct NetScratch {
+    rxq: Queue,
+    txq: Queue,
+    rx_bufs: [Buf; QSIZE],
+    tx_buf: Buf,
+    rx_scratch: [u8; RX_SCRATCH],
+    body: [u8; BODY_MAX],
+}
+
+/// Raw pointer to the network scratch at the base of the reserved region.
+#[inline]
+fn nb() -> *mut NetScratch {
+    mem::netbuf_region_range().0 as *mut NetScratch
+}
 
 struct NetState {
     base: usize,
@@ -151,6 +161,13 @@ static mut NET: NetState = NetState {
 // Static network identity on QEMU user-net (SLIRP).
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
+// QEMU user-net built-in DNS. Overridable by `resolve <name> <ns-ip>`.
+const DEFAULT_NS: [u8; 4] = [10, 0, 2, 3];
+
+// A plaintext marker the fetch amnesia proof plants (via a served payload) and
+// then asserts is gone after a wipe. The boot-test server serves a body
+// containing this exact string.
+const NET_SENTINEL: &[u8] = b"SENTINEL=Zx9Q";
 
 #[inline]
 fn mb() {
@@ -206,8 +223,8 @@ fn setup_queue(base: usize, sel: u32, q: *mut Queue) -> bool {
 /// Add an RX buffer index to the receive queue's available ring.
 fn rx_post(base: usize, i: usize) {
     unsafe {
-        let q = addr_of_mut!(RXQ);
-        let buf = addr_of!(RX_BUFS[i]) as u64;
+        let q = addr_of_mut!((*nb()).rxq);
+        let buf = addr_of!((*nb()).rx_bufs[i]) as u64;
         (*q).desc[i] = VqDesc {
             addr: buf,
             len: BUF_SIZE as u32,
@@ -229,6 +246,12 @@ fn rx_post(base: usize, i: usize) {
 pub fn init() -> bool {
     if unsafe { *addr_of!(NET.up) } {
         return true;
+    }
+    // The scratch struct must fit in the reserved region.
+    let (rs, re) = mem::netbuf_region_range();
+    if core::mem::size_of::<NetScratch>() > re - rs {
+        println!("[net] netbuf region too small for scratch, aborting");
+        return false;
     }
     let base = match find_device() {
         Some(b) => b,
@@ -281,7 +304,8 @@ pub fn init() -> bool {
         return false;
     }
 
-    if !setup_queue(base, 0, addr_of_mut!(RXQ)) || !setup_queue(base, 1, addr_of_mut!(TXQ)) {
+    let (rxq_ptr, txq_ptr) = unsafe { (addr_of_mut!((*nb()).rxq), addr_of_mut!((*nb()).txq)) };
+    if !setup_queue(base, 0, rxq_ptr) || !setup_queue(base, 1, txq_ptr) {
         println!("[net] virtqueue setup failed");
         return false;
     }
@@ -318,12 +342,22 @@ pub fn init() -> bool {
     true
 }
 
+/// Reset the driver's "up" flag. Called by `wipe`, which zeroes the netbuf region
+/// (including the DMA rings), so the next network use re-initializes the device
+/// from scratch instead of trusting stale, now-zeroed rings.
+pub fn on_wipe() {
+    unsafe {
+        NET.up = false;
+        NET.base = 0;
+    }
+}
+
 /// Transmit one Ethernet frame (already including dst/src MAC + ethertype).
 fn send_frame(frame: &[u8]) {
     let base = unsafe { NET.base };
     unsafe {
-        let tx = addr_of_mut!(TXQ);
-        let buf = addr_of_mut!(TX_BUF.0) as *mut u8;
+        let tx = addr_of_mut!((*nb()).txq);
+        let buf = addr_of_mut!((*nb()).tx_buf.0) as *mut u8;
         // 12-byte virtio-net header of zeros, then the frame.
         for i in 0..NET_HDR_LEN {
             core::ptr::write_volatile(buf.add(i), 0);
@@ -353,7 +387,7 @@ fn recv_frame(out: &mut [u8]) -> Option<usize> {
     let base = unsafe { NET.base };
     for _ in 0..20_000_000u64 {
         unsafe {
-            let rx = addr_of_mut!(RXQ);
+            let rx = addr_of_mut!((*nb()).rxq);
             let used_idx = core::ptr::read_volatile(addr_of!((*rx).used.idx));
             let seen = NET.rx_used_seen;
             if used_idx != seen {
@@ -362,7 +396,7 @@ fn recv_frame(out: &mut [u8]) -> Option<usize> {
                 let id = elem.id as usize % QSIZE;
                 let total = elem.len as usize;
                 let frame_len = total.saturating_sub(NET_HDR_LEN);
-                let src = addr_of!(RX_BUFS[id].0) as *const u8;
+                let src = addr_of!((*nb()).rx_bufs[id].0) as *const u8;
                 let n = core::cmp::min(frame_len, out.len());
                 for (i, o) in out.iter_mut().take(n).enumerate() {
                     *o = core::ptr::read_volatile(src.add(NET_HDR_LEN + i));
@@ -388,16 +422,25 @@ fn our_mac() -> [u8; 6] {
     unsafe { NET.mac }
 }
 
-/// Send an ARP request for `GW_IP` and wait for the reply, returning the
-/// gateway's MAC. This is a genuine TX+RX round trip through the virtual network.
-fn arp_resolve_gateway() -> Option<[u8; 6]> {
+#[inline]
+fn cntpct() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+fn in_our_subnet(ip: [u8; 4]) -> bool {
+    ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2]
+}
+
+/// Send an ARP request for `ip` and wait for the reply, returning its MAC. A
+/// genuine TX+RX round trip through the virtual network.
+fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     let mac = our_mac();
     let mut f = [0u8; 42];
-    // Ethernet header.
     f[0..6].copy_from_slice(&BROADCAST);
     f[6..12].copy_from_slice(&mac);
     f[12..14].copy_from_slice(&ET_ARP.to_be_bytes());
-    // ARP payload.
     f[14..16].copy_from_slice(&1u16.to_be_bytes()); // htype ethernet
     f[16..18].copy_from_slice(&ET_IPV4.to_be_bytes()); // ptype IPv4
     f[18] = 6; // hlen
@@ -406,7 +449,7 @@ fn arp_resolve_gateway() -> Option<[u8; 6]> {
     f[22..28].copy_from_slice(&mac);
     f[28..32].copy_from_slice(&OUR_IP);
     f[32..38].copy_from_slice(&[0u8; 6]);
-    f[38..42].copy_from_slice(&GW_IP);
+    f[38..42].copy_from_slice(&ip);
     send_frame(&f);
 
     let mut buf = [0u8; BUF_SIZE];
@@ -415,67 +458,86 @@ fn arp_resolve_gateway() -> Option<[u8; 6]> {
         if n >= 42 {
             let et = u16::from_be_bytes([buf[12], buf[13]]);
             let op = u16::from_be_bytes([buf[20], buf[21]]);
-            if et == ET_ARP && op == 2 && buf[28..32] == GW_IP {
-                let mut gw = [0u8; 6];
-                gw.copy_from_slice(&buf[22..28]);
-                return Some(gw);
+            if et == ET_ARP && op == 2 && buf[28..32] == ip {
+                let mut m = [0u8; 6];
+                m.copy_from_slice(&buf[22..28]);
+                return Some(m);
             }
         }
     }
     None
 }
 
+/// Resolve the layer-2 next hop for `dst_ip`: the host itself if it is on our
+/// subnet, otherwise the gateway.
+fn next_hop_mac(dst_ip: [u8; 4]) -> Option<[u8; 6]> {
+    let target = if in_our_subnet(dst_ip) { dst_ip } else { GW_IP };
+    arp_resolve(target)
+}
+
 fn ip_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
+    proto::ipv4_checksum(data)
+}
+
+/// Send one IPv4 packet carrying `payload` (a UDP or TCP segment) to `dst_ip` via
+/// `dst_mac`. The don't-fragment flag is set so responses come back as transport
+/// segments, never IP fragments.
+fn send_ipv4(dst_mac: [u8; 6], dst_ip: [u8; 4], protocol: u8, payload: &[u8]) -> bool {
+    let mac = our_mac();
+    let ip_total = 20 + payload.len();
+    let frame_len = 14 + ip_total;
+    let mut f = [0u8; 14 + 20 + 1500];
+    if frame_len > f.len() {
+        return false;
     }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    f[0..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&ET_IPV4.to_be_bytes());
+    f[14] = 0x45; // version 4, IHL 5
+    f[15] = 0;
+    f[16..18].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    f[18..20].copy_from_slice(&0u16.to_be_bytes()); // id
+    f[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // don't fragment
+    f[22] = 64; // TTL
+    f[23] = protocol;
+    f[26..30].copy_from_slice(&OUR_IP);
+    f[30..34].copy_from_slice(&dst_ip);
+    let c = ip_checksum(&f[14..34]);
+    f[24..26].copy_from_slice(&c.to_be_bytes());
+    f[34..34 + payload.len()].copy_from_slice(payload);
+    send_frame(&f[..frame_len]);
+    true
 }
 
 /// Send an ICMP echo request carrying `token` to the gateway and wait for the
-/// echo reply, returning the echoed token bytes. A real request/response with a
-/// payload: an agent sends data out and gets a result back.
+/// echo reply, returning the echoed token bytes.
 fn icmp_echo(gw: [u8; 6], token: &[u8]) -> Option<[u8; 16]> {
     let mac = our_mac();
     let payload_len = core::cmp::min(token.len(), 16);
-    let icmp_len = 8 + payload_len; // ICMP header + payload
+    let icmp_len = 8 + payload_len;
     let ip_total = 20 + icmp_len;
     let frame_len = 14 + ip_total;
 
     let mut f = [0u8; 14 + 20 + 8 + 16];
-    // Ethernet.
     f[0..6].copy_from_slice(&gw);
     f[6..12].copy_from_slice(&mac);
     f[12..14].copy_from_slice(&ET_IPV4.to_be_bytes());
-    // IPv4 header.
-    f[14] = 0x45; // version 4, IHL 5
+    f[14] = 0x45;
     f[15] = 0;
     f[16..18].copy_from_slice(&(ip_total as u16).to_be_bytes());
-    f[18..20].copy_from_slice(&0x1234u16.to_be_bytes()); // id
-    f[20..22].copy_from_slice(&0u16.to_be_bytes()); // flags/frag
-    f[22] = 64; // TTL
-    f[23] = 1; // protocol ICMP
-    // checksum (24..26) zero for now
+    f[18..20].copy_from_slice(&0x1234u16.to_be_bytes());
+    f[20..22].copy_from_slice(&0u16.to_be_bytes());
+    f[22] = 64;
+    f[23] = 1; // ICMP
     f[26..30].copy_from_slice(&OUR_IP);
     f[30..34].copy_from_slice(&GW_IP);
     let ipcsum = ip_checksum(&f[14..34]);
     f[24..26].copy_from_slice(&ipcsum.to_be_bytes());
-    // ICMP echo request.
     let icmp = 34;
-    f[icmp] = 8; // type echo request
-    f[icmp + 1] = 0; // code
-    // checksum icmp+2..icmp+4 zero for now
-    f[icmp + 4..icmp + 6].copy_from_slice(&0xABCDu16.to_be_bytes()); // id
-    f[icmp + 6..icmp + 8].copy_from_slice(&1u16.to_be_bytes()); // seq
+    f[icmp] = 8; // echo request
+    f[icmp + 1] = 0;
+    f[icmp + 4..icmp + 6].copy_from_slice(&0xABCDu16.to_be_bytes());
+    f[icmp + 6..icmp + 8].copy_from_slice(&1u16.to_be_bytes());
     f[icmp + 8..icmp + 8 + payload_len].copy_from_slice(&token[..payload_len]);
     let icmpcsum = ip_checksum(&f[icmp..icmp + icmp_len]);
     f[icmp + 2..icmp + 4].copy_from_slice(&icmpcsum.to_be_bytes());
@@ -491,7 +553,6 @@ fn icmp_echo(gw: [u8; 6], token: &[u8]) -> Option<[u8; 16]> {
                 let ihl = ((buf[14] & 0x0f) as usize) * 4;
                 let icmp = 14 + ihl;
                 if buf[icmp] == 0 && buf.len() >= icmp + 8 + payload_len {
-                    // echo reply
                     let mut echoed = [0u8; 16];
                     echoed[..payload_len].copy_from_slice(&buf[icmp + 8..icmp + 8 + payload_len]);
                     return Some(echoed);
@@ -500,6 +561,512 @@ fn icmp_echo(gw: [u8; 6], token: &[u8]) -> Option<[u8; 16]> {
         }
     }
     None
+}
+
+// --- UDP / DNS ---------------------------------------------------------------
+
+/// A weakly-random 16-bit value from the cycle counter, for DNS ids and ports.
+fn rand16() -> u16 {
+    let c = cntpct();
+    ((c ^ (c >> 17) ^ (c >> 31)) as u16) | 1
+}
+
+/// Resolve `name`'s A record via the DNS server `ns_ip` over UDP. Returns the
+/// IPv4 address, or None on timeout or no address. The response lands in the
+/// wiped netbuf region.
+pub fn resolve(name: &str, ns_ip: [u8; 4]) -> Option<[u8; 4]> {
+    if !init() {
+        return None;
+    }
+    let ns_mac = next_hop_mac(ns_ip)?;
+    let id = rand16();
+    let src_port = 0xC000 | (rand16() & 0x0fff);
+
+    let mut query = [0u8; 512];
+    let qlen = proto::build_dns_query(id, name, &mut query)?;
+    let mut udp = [0u8; 600];
+    let ulen = proto::build_udp(OUR_IP, ns_ip, src_port, 53, &query[..qlen], &mut udp)?;
+
+    for _ in 0..4 {
+        send_ipv4(ns_mac, ns_ip, proto::IP_PROTO_UDP, &udp[..ulen]);
+        // Wait for a matching UDP response from the nameserver.
+        for _ in 0..16 {
+            let rx: &mut [u8] = unsafe { &mut (*nb()).rx_scratch };
+            let n = match recv_frame(rx) {
+                Some(n) => n,
+                None => break, // timeout: retransmit the query
+            };
+            if n < 34 || u16::from_be_bytes([rx[12], rx[13]]) != ET_IPV4 {
+                continue;
+            }
+            if rx[23] != proto::IP_PROTO_UDP || rx[26..30] != ns_ip {
+                continue;
+            }
+            let ihl = ((rx[14] & 0x0f) as usize) * 4;
+            let ip_total = u16::from_be_bytes([rx[16], rx[17]]) as usize;
+            let off = 14 + ihl;
+            let end = 14 + ip_total;
+            if end > n || off + 8 > end {
+                continue;
+            }
+            let (sp, _dp, poff, plen) = match proto::parse_udp(&rx[off..end]) {
+                Some(x) => x,
+                None => continue,
+            };
+            if sp != 53 {
+                continue;
+            }
+            let ds = off + poff;
+            match proto::parse_dns_response(&rx[ds..ds + plen], id) {
+                DnsResult::Ipv4(ip) => return Some(ip),
+                DnsResult::NoAddress => return None,
+                DnsResult::Invalid => continue,
+            }
+        }
+    }
+    None
+}
+
+// --- TCP one-shot client -----------------------------------------------------
+
+/// State for one active outbound TCP connection.
+struct Tcp {
+    dst_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    dst_port: u16,
+    src_port: u16,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+}
+
+const TCP_WINDOW: u16 = 32768;
+const MAX_FRAMES_PER_POLL: usize = 24;
+
+fn tcp_send(t: &Tcp, flags: u8, payload: &[u8]) -> bool {
+    let mut seg = [0u8; 20 + 1460];
+    let len = match proto::build_tcp(
+        OUR_IP, t.dst_ip, t.src_port, t.dst_port, t.snd_nxt, t.rcv_nxt, flags, TCP_WINDOW, payload,
+        &mut seg,
+    ) {
+        Some(l) => l,
+        None => return false,
+    };
+    send_ipv4(t.dst_mac, t.dst_ip, proto::IP_PROTO_TCP, &seg[..len])
+}
+
+/// Poll for the next TCP segment of this connection. Copies its payload into
+/// `out` and returns `(seq, ack, flags, payload_len)`, or None on timeout.
+fn tcp_poll(t: &Tcp, out: &mut [u8]) -> Option<(u32, u32, u8, usize)> {
+    for _ in 0..MAX_FRAMES_PER_POLL {
+        let rx: &mut [u8] = unsafe { &mut (*nb()).rx_scratch };
+        let n = recv_frame(rx)?;
+        if n < 34 || u16::from_be_bytes([rx[12], rx[13]]) != ET_IPV4 {
+            continue;
+        }
+        if rx[23] != proto::IP_PROTO_TCP || rx[26..30] != t.dst_ip {
+            continue;
+        }
+        let ihl = ((rx[14] & 0x0f) as usize) * 4;
+        let ip_total = u16::from_be_bytes([rx[16], rx[17]]) as usize;
+        let seg_off = 14 + ihl;
+        let seg_end = 14 + ip_total;
+        if seg_end > n || seg_off + 20 > seg_end {
+            continue;
+        }
+        let seg = match proto::parse_tcp(&rx[seg_off..seg_end]) {
+            Some(s) => s,
+            None => continue,
+        };
+        if seg.src_port != t.dst_port || seg.dst_port != t.src_port {
+            continue;
+        }
+        let dlen = core::cmp::min(seg.data_len, out.len());
+        let dstart = seg_off + seg.data_off;
+        out[..dlen].copy_from_slice(&rx[dstart..dstart + dlen]);
+        return Some((seg.seq, seg.ack, seg.flags, dlen));
+    }
+    None
+}
+
+/// Open a TCP connection with the three-way handshake. Retransmits the SYN a
+/// bounded number of times so a lost packet cannot hang the client.
+fn tcp_connect(dst_ip: [u8; 4], dst_mac: [u8; 6], dst_port: u16) -> Option<Tcp> {
+    let iss = ((cntpct() as u32).wrapping_mul(2_654_435_761)) ^ 0x5f37_59df;
+    let src_port = 0xC000 | (rand16() & 0x0fff);
+    let mut t = Tcp {
+        dst_ip,
+        dst_mac,
+        dst_port,
+        src_port,
+        snd_nxt: iss,
+        rcv_nxt: 0,
+    };
+    let mut scratch = [0u8; 64];
+    for _ in 0..6 {
+        // SYN carries one sequence number.
+        t.snd_nxt = iss;
+        tcp_send(&t, proto::TCP_SYN, &[]);
+        if let Some((seq, ack, flags, _)) = tcp_poll(&t, &mut scratch) {
+            if flags & proto::TCP_RST != 0 {
+                return None;
+            }
+            if flags & (proto::TCP_SYN | proto::TCP_ACK) == (proto::TCP_SYN | proto::TCP_ACK)
+                && ack == iss.wrapping_add(1)
+            {
+                t.rcv_nxt = seq.wrapping_add(1);
+                t.snd_nxt = iss.wrapping_add(1);
+                tcp_send(&t, proto::TCP_ACK, &[]);
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// Send the FIN teardown and briefly acknowledge the peer's FIN.
+fn tcp_close(t: &mut Tcp) {
+    tcp_send(t, proto::TCP_FIN | proto::TCP_ACK, &[]);
+    t.snd_nxt = t.snd_nxt.wrapping_add(1);
+    let mut scratch = [0u8; 64];
+    for _ in 0..4 {
+        match tcp_poll(t, &mut scratch) {
+            Some((seq, _ack, flags, dlen)) => {
+                if flags & proto::TCP_FIN != 0 {
+                    t.rcv_nxt = seq.wrapping_add(dlen as u32).wrapping_add(1);
+                    tcp_send(t, proto::TCP_ACK, &[]);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+// --- HTTP/1.0 client ---------------------------------------------------------
+
+/// Perform an HTTP/1.0 GET. The full response (status line, headers, body) is
+/// assembled into the netbuf `body` region. Returns `(status, body_offset,
+/// total_len)` where the body is `body[body_offset..total_len]`.
+fn http_get(
+    dst_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    port: u16,
+    host: &str,
+    path: &str,
+) -> Option<(u16, usize, usize)> {
+    let mut t = tcp_connect(dst_ip, dst_mac, port)?;
+
+    // Build the request. HTTP/1.0 with an explicit close: the server writes the
+    // whole body then FINs, which is our clean end-of-body signal.
+    let mut req = [0u8; 512];
+    let mut w = ReqWriter::new(&mut req);
+    w.put(b"GET ");
+    w.put(path.as_bytes());
+    w.put(b" HTTP/1.0\r\nHost: ");
+    w.put(host.as_bytes());
+    w.put(b"\r\nUser-Agent: aurora/1.0\r\nConnection: close\r\n\r\n");
+    let reqlen = w.len();
+    tcp_send(&t, proto::TCP_PSH | proto::TCP_ACK, &req[..reqlen]);
+    t.snd_nxt = t.snd_nxt.wrapping_add(reqlen as u32);
+
+    let mut total = 0usize;
+    let mut idle = 0;
+    let mut got_fin = false;
+    let mut seg = [0u8; 1600];
+    loop {
+        match tcp_poll(&t, &mut seg) {
+            Some((seq, _ack, flags, dlen)) => {
+                idle = 0;
+                if flags & proto::TCP_RST != 0 {
+                    break;
+                }
+                if dlen > 0 {
+                    if seq == t.rcv_nxt {
+                        // In-order data: append to the body region, bounded.
+                        let room = BODY_MAX.saturating_sub(total);
+                        let take = core::cmp::min(dlen, room);
+                        unsafe {
+                            let dst = (*nb()).body.as_mut_ptr().add(total);
+                            core::ptr::copy_nonoverlapping(seg.as_ptr(), dst, take);
+                        }
+                        total += take;
+                        t.rcv_nxt = t.rcv_nxt.wrapping_add(dlen as u32);
+                    }
+                    // Acknowledge (cumulative) either way.
+                    tcp_send(&t, proto::TCP_ACK, &[]);
+                }
+                if flags & proto::TCP_FIN != 0 {
+                    // The FIN consumes one sequence number if it is in order.
+                    if seq.wrapping_add(dlen as u32) == t.rcv_nxt {
+                        t.rcv_nxt = t.rcv_nxt.wrapping_add(1);
+                    }
+                    tcp_send(&t, proto::TCP_ACK, &[]);
+                    got_fin = true;
+                    break;
+                }
+                if total >= BODY_MAX {
+                    break;
+                }
+            }
+            None => {
+                idle += 1;
+                if idle >= 6 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Send our FIN. If the peer already FINed we still send ours for a clean
+    // close; otherwise this initiates the teardown.
+    let _ = got_fin;
+    tcp_close(&mut t);
+
+    let resp = unsafe { &(&(*nb()).body)[..total] };
+    let (status, body_off) = proto::parse_http_response(resp)?;
+    Some((status, body_off, total))
+}
+
+// --- Shell entry points ------------------------------------------------------
+
+/// Parse `dotted` as an IPv4 address, e.g. "10.0.2.2".
+fn parse_ipv4(dotted: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = dotted.split('.');
+    for o in out.iter_mut() {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 3 {
+            return None;
+        }
+        *o = p.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Split `http://host[:port]/path` into `(host, port, path)`.
+fn parse_url(url: &str) -> Option<(&str, u16, &str)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rfind(':') {
+        Some(i) => (&authority[..i], authority[i + 1..].parse::<u16>().ok()?),
+        None => (authority, 80u16),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path))
+}
+
+/// Resolve a URL host to an IPv4 address: dotted-decimal is used directly, a name
+/// goes through DNS on the default nameserver.
+fn resolve_host(host: &str) -> Option<[u8; 4]> {
+    if let Some(ip) = parse_ipv4(host) {
+        return Some(ip);
+    }
+    resolve(host, DEFAULT_NS)
+}
+
+fn print_ip(ip: [u8; 4]) {
+    print!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+}
+
+/// Count occurrences of `needle` across the whole netbuf region.
+fn scan_netbuf(needle: &[u8]) -> u64 {
+    let (start, end) = mem::netbuf_region_range();
+    let n = needle.len();
+    if n == 0 || end - start < n {
+        return 0;
+    }
+    let first = needle[0];
+    let mut count = 0u64;
+    let mut p = start;
+    let last = end - n;
+    while p <= last {
+        if unsafe { core::ptr::read_volatile(p as *const u8) } == first {
+            let mut ok = true;
+            for (i, &nb) in needle.iter().enumerate().skip(1) {
+                if unsafe { core::ptr::read_volatile((p + i) as *const u8) } != nb {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                count += 1;
+            }
+        }
+        p += 1;
+    }
+    count
+}
+
+/// `fetch <url>`: resolve, TCP-connect, HTTP GET, and print the status and body.
+pub fn shell_fetch(url: &str) {
+    if !crate::session::has_net() {
+        println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
+        return;
+    }
+    if !init() {
+        println!("[net] device unavailable");
+        return;
+    }
+    let (host, port, path) = match parse_url(url) {
+        Some(x) => x,
+        None => {
+            println!("[fetch] bad url (expected http://host[:port]/path)");
+            return;
+        }
+    };
+    print!("[fetch] GET http://{}:{}{} -> resolving {} ... ", host, port, path, host);
+    let ip = match resolve_host(host) {
+        Some(ip) => {
+            print_ip(ip);
+            println!();
+            ip
+        }
+        None => {
+            println!("FAILED (dns)");
+            return;
+        }
+    };
+    let mac = match next_hop_mac(ip) {
+        Some(m) => m,
+        None => {
+            println!("[fetch] ARP failed for next hop");
+            return;
+        }
+    };
+    match http_get(ip, mac, port, host, path) {
+        Some((status, body_off, total)) => {
+            let body_len = total.saturating_sub(body_off);
+            println!("[fetch] HTTP status: {}, body {} bytes", status, body_len);
+            // Print a bounded slice of the body so a large response cannot flood
+            // the console. The body lives in the netbuf region, scrubbed on wipe.
+            let show = core::cmp::min(body_len, 1024);
+            print!("[fetch] body: ");
+            let body = unsafe { &(&(*nb()).body)[body_off..body_off + show] };
+            match core::str::from_utf8(body) {
+                Ok(s) => print!("{}", s),
+                Err(_) => {
+                    for b in body {
+                        print!("{:02x}", b);
+                    }
+                }
+            }
+            println!();
+        }
+        None => println!("[fetch] request failed (no response / bad HTTP)"),
+    }
+}
+
+/// `resolve <name> [ns-ip]`: best-effort live DNS lookup that prints the A record.
+pub fn shell_resolve(args: &str) {
+    if !crate::session::has_net() {
+        println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
+        return;
+    }
+    let mut it = args.split_whitespace();
+    let name = match it.next() {
+        Some(n) => n,
+        None => {
+            println!("usage: resolve <name> [nameserver-ip]");
+            return;
+        }
+    };
+    let ns = it.next().and_then(parse_ipv4).unwrap_or(DEFAULT_NS);
+    print!("[dns] resolving {} via ", name);
+    print_ip(ns);
+    print!(" ... ");
+    match resolve(name, ns) {
+        Some(ip) => {
+            print!("A record ");
+            print_ip(ip);
+            println!(" (live DNS ok)");
+        }
+        None => println!("no answer (offline or no record); not a gate failure"),
+    }
+}
+
+/// `netamnesia <url>`: fetch a payload carrying a known sentinel into the network
+/// buffers, confirm it is present, wipe, then prove the sentinel is gone from the
+/// whole netbuf region. This extends the amnesia proof to fetched network bytes.
+pub fn shell_netamnesia(url: &str) {
+    if !crate::session::has_net() {
+        println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
+        return;
+    }
+    if !init() {
+        println!("[net] device unavailable");
+        return;
+    }
+    println!("[netamnesia] === proving fetched network bytes do not survive a wipe ===");
+    let (host, port, path) = match parse_url(url) {
+        Some(x) => x,
+        None => {
+            println!("[netamnesia] bad url");
+            return;
+        }
+    };
+    let ip = match resolve_host(host) {
+        Some(ip) => ip,
+        None => {
+            println!("[netamnesia] resolve failed");
+            return;
+        }
+    };
+    let mac = match next_hop_mac(ip) {
+        Some(m) => m,
+        None => {
+            println!("[netamnesia] ARP failed");
+            return;
+        }
+    };
+    let ok = http_get(ip, mac, port, host, path).is_some();
+    let pre = scan_netbuf(NET_SENTINEL);
+    println!(
+        "[netamnesia] fetched (ok={}); sentinel appears {} time(s) in the network buffers before wipe",
+        ok, pre
+    );
+    if pre == 0 {
+        println!("[netamnesia] FAIL: sentinel not found in fetched bytes (payload/route wrong)");
+        return;
+    }
+    crate::wipe::wipe_and_report();
+    let post = scan_netbuf(NET_SENTINEL);
+    println!(
+        "[netamnesia] post-wipe scan: sentinel appears {} time(s) in the network buffers",
+        post
+    );
+    if post == 0 {
+        println!("[netamnesia] PASS: fetched network bytes scrubbed, sentinel fully gone");
+    } else {
+        println!("[netamnesia] FAIL: fetched bytes survived the wipe");
+    }
+}
+
+/// Small fixed-buffer writer for building the HTTP request without the heap.
+struct ReqWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> ReqWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn put(&mut self, bytes: &[u8]) {
+        let n = core::cmp::min(bytes.len(), self.buf.len() - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+    }
+    fn len(&self) -> usize {
+        self.pos
+    }
 }
 
 /// Shell entry: bring the NIC up (requires CAP_NET), resolve the gateway by ARP,
@@ -514,7 +1081,7 @@ pub fn shell_roundtrip(msg: &str) {
         return;
     }
     println!("[net] resolving gateway {}.{}.{}.{} via ARP...", GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3]);
-    let gw = match arp_resolve_gateway() {
+    let gw = match arp_resolve(GW_IP) {
         Some(g) => {
             println!(
                 "[net] ARP reply: gateway is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (round trip ok)",
@@ -533,10 +1100,7 @@ pub fn shell_roundtrip(msg: &str) {
             let n = core::cmp::min(token.len(), 16);
             let ok = echoed[..n] == token[..n];
             let text = core::str::from_utf8(&echoed[..n]).unwrap_or("<binary>");
-            println!(
-                "[net] ICMP echo reply received: \"{}\" (payload match: {})",
-                text, ok
-            );
+            println!("[net] ICMP echo reply received: \"{}\" (payload match: {})", text, ok);
             if ok {
                 println!("[net] round trip complete: sent a task and received the result back");
             }

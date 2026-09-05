@@ -62,6 +62,9 @@ pub fn exec(line: &str) -> bool {
             println!("  cap net              grant the revocable network capability");
             println!("  cap revoke net       revoke the network capability");
             println!("  net <msg>            round-trip a message over CAP_NET (needs CAP_NET)");
+            println!("  fetch <url>          HTTP/1.0 GET http://host[:port]/path (needs CAP_NET)");
+            println!("  resolve <name> [ns]  live DNS A-record lookup (needs CAP_NET)");
+            println!("  netamnesia <url>     prove fetched bytes do not survive a wipe");
             println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
             println!("  panic                trigger a kernel panic (wipes on the way down)");
@@ -176,6 +179,30 @@ pub fn exec(line: &str) -> bool {
             let rest = line.strip_prefix("net").unwrap_or("").trim();
             let msg = if rest.is_empty() { "aurora-agent-task" } else { rest };
             crate::net::shell_roundtrip(msg);
+        }
+        "fetch" => {
+            let rest = line.strip_prefix("fetch").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("usage: fetch http://host[:port]/path");
+            } else {
+                crate::net::shell_fetch(rest);
+            }
+        }
+        "resolve" => {
+            let rest = line.strip_prefix("resolve").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("usage: resolve <name> [nameserver-ip]");
+            } else {
+                crate::net::shell_resolve(rest);
+            }
+        }
+        "netamnesia" => {
+            let rest = line.strip_prefix("netamnesia").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("usage: netamnesia http://host[:port]/path");
+            } else {
+                crate::net::shell_netamnesia(rest);
+            }
         }
         "el0test" => {
             crate::isolation::run_el0_probe();

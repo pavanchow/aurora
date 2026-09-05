@@ -25,6 +25,7 @@ mod mem;
 mod net;
 mod mmu;
 mod persistence;
+mod proto;
 mod ptable;
 mod runqueue;
 mod sched;
