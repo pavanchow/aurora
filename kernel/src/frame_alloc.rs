@@ -108,7 +108,7 @@ mod tests {
         let mut fa = FrameAllocator::new(0x4000_0000, 16 * FRAME_SIZE, &mut bm);
         let a = fa.alloc().unwrap();
         assert_eq!(a % FRAME_SIZE, 0);
-        assert!(a >= 0x4000_0000 && a < 0x4000_0000 + 16 * FRAME_SIZE);
+        assert!((0x4000_0000..0x4000_0000 + 16 * FRAME_SIZE).contains(&a));
     }
 
     #[test]

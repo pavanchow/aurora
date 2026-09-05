@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(wiped, KEY_LEN + 1024);
         // After wipe the key is zero and the region is all zero.
         assert!(v.get("s", &mut [0u8; MAX_VAL]).is_none());
-        drop(v);
+        let _ = v; // end the &mut borrow of `region` before reading it back
         assert!(region.iter().all(|&b| b == 0), "region not fully scrubbed");
         // The secret plaintext is gone from the region.
         assert!(!region.windows(secret.len()).any(|w| w == secret));
