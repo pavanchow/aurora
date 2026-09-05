@@ -1,0 +1,15 @@
+[package]
+name = "aurora"
+version = "0.1.0"
+edition = "2021"
+description = "Aurora concepts layer: a deterministic OS-kernel simulator in pure std Rust"
+license = "MIT"
+repository = "https://github.com/pavanchow/aurora"
+
+[[bin]]
+name = "aurora"
+path = "src/bin/aurora.rs"
+
+[lib]
+name = "aurora"
+path = "src/lib.rs"
