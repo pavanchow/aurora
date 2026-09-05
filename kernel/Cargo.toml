@@ -1,0 +1,19 @@
+[package]
+name = "aurora-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Aurora: a real bootable aarch64 (ARM64) operating-system kernel"
+license = "MIT"
+repository = "https://github.com/pavanchow/aurora"
+
+[[bin]]
+name = "aurora-kernel"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
