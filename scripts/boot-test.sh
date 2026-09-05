@@ -47,7 +47,50 @@ info "[1/3] building kernel (release, aarch64-unknown-none)"
 [ -f "$ELF" ] || { red "kernel ELF not found at $ELF"; exit 2; }
 
 OUT="$(mktemp)"
-trap 'rm -f "$OUT"' EXIT
+
+# Deterministic end-to-end proof of the TCP + HTTP path: serve a file with a
+# known unique payload from a local HTTP server on the host. QEMU user-net maps
+# the host at 10.0.2.2, so from inside Aurora `fetch http://10.0.2.2:<port>/...`
+# must return this exact payload. No dependency on flaky external internet.
+PAYLOAD='COLLATZ-STOP-27=111 PEAK=9232 SENTINEL=Zx9Q'
+WWW_DIR="$(mktemp -d)"
+printf '%s\n' "$PAYLOAD" > "$WWW_DIR/collatz.txt"
+
+# Pick a free TCP port on the loopback for the server.
+HTTP_PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+
+info "[server] starting local HTTP server on 127.0.0.1:${HTTP_PORT} serving collatz.txt"
+( cd "$WWW_DIR" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 ) \
+    >"$WWW_DIR/server.log" 2>&1 &
+HTTP_PID=$!
+disown "$HTTP_PID" 2>/dev/null || true
+
+cleanup() {
+    kill "$HTTP_PID" >/dev/null 2>&1
+    rm -f "$OUT"
+    rm -rf "$WWW_DIR"
+}
+trap cleanup EXIT
+
+# Wait until the server actually accepts connections (bounded).
+for _ in $(seq 1 50); do
+    if python3 - "$HTTP_PORT" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+s.connect(("127.0.0.1", int(sys.argv[1])))
+s.close()
+PY
+    then break; fi
+    sleep 0.1
+done
 
 info "[2/3] booting in QEMU (timeout ${TIMEOUT_SECS}s)"
 
@@ -67,6 +110,11 @@ shell_script() {
     # Connectivity: grant the revocable network cap and round-trip a task.
     printf 'cap net\n'
     printf 'net aurora-agent-task-01\n'
+    # Transport + resolver: a real HTTP/1.0 GET over TCP against the local host
+    # server (10.0.2.2 is the QEMU user-net host alias), and a best-effort live
+    # DNS lookup via the built-in nameserver at 10.0.2.3.
+    printf 'fetch http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
+    printf 'resolve example.com\n'
     # Multi-line Kindling program: sum of primes below 1000 (=76127), then
     # factor 561 and check Korselt's criterion (Carmichael number).
     printf 'compute\n'
@@ -76,6 +124,9 @@ shell_script() {
     printf 'let m=n; let p=2; while(p<=m){ if(m%%p==0){ print p; let e=0; while(m%%p==0){m=m/p; e=e+1;} if(e>1){carm=0;} if((n-1)%%(p-1)!=0){carm=0;} } p=p+1; }\n'
     printf 'if(carm==1){ print "561 is a Carmichael number"; } else { print "561 is NOT Carmichael"; }\n'
     printf '.\n'
+    # Amnesia of network buffers: fetch a payload carrying a known sentinel, then
+    # wipe, then prove the sentinel is gone from the whole network scratch region.
+    printf 'netamnesia http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
     printf 'wipe\n'
     printf 'ps\n'
     printf 'uptime\n'
@@ -140,7 +191,7 @@ require "AMNESIA PROOF"          "[amnesia] PASS:"
 # Privacy hardening: real entropy source, and the kernel stack is scrubbed so a
 # decrypted vault secret does not survive a wipe on the stack.
 require "hardware entropy source"  "[entropy] source: RNDR (ARMv8.5 hardware RNG)"
-require "wipe covers the stack"    "key+vault+frames+stack"
+require "wipe covers the stack"    "key+vault+frames+net+stack"
 require "kernel stack scrubbed"    "post-wipe kernel-stack scan: sentinel plaintext appears 0 times"
 
 # Compute: the embedded Kindling interpreter, gated by CAP_COMPUTE.
@@ -164,12 +215,30 @@ require "NIC is up"                "[net] up: MAC"
 require "ARP round trip"           "ARP reply: gateway is at"
 require "ICMP echo round trip"     "round trip complete: sent a task and received the result back"
 
+# Transport + resolver: a full TCP handshake + HTTP/1.0 GET against the local
+# host server must return the exact known payload. This is the deterministic
+# end-to-end proof of the UDP-free TCP path and the HTTP client.
+require "HTTP GET status 200"      "HTTP status: 200"
+require "fetch returned payload"   "$PAYLOAD"
+# Amnesia of fetched network bytes: the sentinel is present before the wipe and
+# gone from the whole network scratch region afterwards.
+require "netamnesia scrubs bytes"  "post-wipe scan: sentinel appears 0 time(s) in the network buffers"
+require "netamnesia PASS"          "[netamnesia] PASS:"
+
+# Live DNS is best-effort: assert nothing hard, just surface the result.
+if grep -qF "live DNS ok" "$OUT"; then
+    green "  ok   live DNS resolved (best-effort)"
+elif grep -qF "not a gate failure" "$OUT"; then
+    info  "  note live DNS offline (best-effort, not a gate failure)"
+fi
+
 require "clean shutdown"         "[shutdown] powering off"
 
 # No crashes, and the amnesia proof must not have failed.
 refute "no CPU exception"        "\*\*\* EXCEPTION"
 refute "no panic"                "\[panic\]"
 refute "amnesia did not fail"    "\[amnesia\] FAIL"
+refute "netamnesia did not fail" "\[netamnesia\] FAIL"
 
 # Interleaving: a task-B line must appear before the last task-A line AND a
 # task-A line before the last task-B line. That is only possible if the scheduler
