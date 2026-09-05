@@ -14,7 +14,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KERNEL_DIR="$ROOT/kernel"
 ELF="$KERNEL_DIR/target/aarch64-unknown-none/release/aurora-kernel"
-TIMEOUT_SECS="${AURORA_BOOT_TIMEOUT:-40}"
+TIMEOUT_SECS="${AURORA_BOOT_TIMEOUT:-60}"
 
 QEMU="${QEMU:-qemu-system-aarch64}"
 
@@ -50,7 +50,7 @@ OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
 info "[2/3] booting in QEMU (timeout ${TIMEOUT_SECS}s)"
-printf 'help\nps\nuptime\nmem\necho hello from aurora\nexit\n' | \
+printf 'help\nsession start\nvault put api-key s3cr3t-token-value\nvault get api-key\nrun hello\nrun sum\nvault list\nwipe\nps\nuptime\nmem\necho hello from aurora\nexit\n' | \
     run_with_timeout "$TIMEOUT_SECS" \
         "$QEMU" -M virt -cpu cortex-a72 -m 512 -nographic -semihosting \
         -kernel "$ELF" >"$OUT" 2>&1
@@ -91,11 +91,23 @@ require "task A ran"             "[task-A]"
 require "task B ran"             "[task-B]"
 require "syscall round-trip"     "[syscall] write ok"
 require "interactive shell"      "aurora shell commands"
+
+# Amnesic / encrypted / wipe: the Tails-for-agents headline proofs.
+require "agent session starts"   "[session] started"
+require "vault encrypts (ct)"    "bytes ciphertext:"
+require "vault round-trip"       "get 'api-key' -> \"s3cr3t-token-value\""
+require "agent task ran"         "hello from an ephemeral agent task"
+require "wipe measured"          "[wipe] scrubbed"
+require "wipe timed in cycles"   "cycles"
+require "no persistence"         "durable writes this session: 0"
+require "AMNESIA PROOF"          "[amnesia] PASS: session RAM is clean"
+
 require "clean shutdown"         "[shutdown] powering off"
 
-# No crashes.
+# No crashes, and the amnesia proof must not have failed.
 refute "no CPU exception"        "\*\*\* EXCEPTION"
 refute "no panic"                "\[panic\]"
+refute "amnesia did not fail"    "\[amnesia\] FAIL"
 
 # Interleaving: a task-B line must appear before the last task-A line AND a
 # task-A line before the last task-B line. That is only possible if the scheduler
