@@ -6,11 +6,17 @@
 //! or MMIO so the exact code that runs on the aarch64 kernel is what the tests
 //! exercise. The single source of truth lives under `kernel/src/`.
 
+#[path = "../../kernel/src/crypto.rs"]
+pub mod crypto;
+
 #[path = "../../kernel/src/frame_alloc.rs"]
 pub mod frame_alloc;
 
 #[path = "../../kernel/src/heap.rs"]
 pub mod heap;
+
+#[path = "../../kernel/src/vault.rs"]
+pub mod vault;
 
 #[path = "../../kernel/src/ptable.rs"]
 pub mod ptable;
