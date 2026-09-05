@@ -1,200 +1,199 @@
 # Aurora design
 
-Aurora models the mechanisms of an operating-system kernel as a deterministic
-in-process simulation. This document explains the architecture, each subsystem,
-and why every correctness gate proves the claim it stands for. There are no
-external dependencies. Everything is pure std on edition 2021.
+Aurora is a real aarch64 kernel that boots on the QEMU `virt` machine. This
+document explains how it boots, how each subsystem works, and how the boot test
+proves the whole thing actually ran. The kernel is `no_std`, `no_main`, and uses
+no external crates. It uses only `core` and the built-in `alloc` crate behind a
+`#[global_allocator]` that the kernel provides.
 
-## Why a simulator
+## Crate layout and why it is split
 
-A real kernel runs in `no_std`, boots on bare metal or under a hypervisor, and
-cannot be unit tested in CI or embedded in a web page. That makes it a poor
-teaching artifact even though the ideas inside it are what people actually want
-to learn. Aurora keeps the ideas and drops the boot. Each mechanism is
-reimplemented as ordinary data and functions, so it can be stepped one tick at a
-time, inspected field by field, and checked by tests. The tradeoff is explicit.
-Aurora is a teaching-accurate model of kernel mechanics, not a bootable
-operating system.
+A bare-metal kernel cannot run the host test harness, and a host test cannot run
+aarch64 assembly. Aurora resolves this without duplicating code.
 
-## The deterministic simulation approach
+- `kernel/` is the real kernel. It is excluded from the workspace so host tooling
+  never tries to build it for the host triple. It carries its own
+  `.cargo/config.toml` that pins `aarch64-unknown-none`, sets the QEMU runner,
+  and a `build.rs` that passes the linker script.
+- `logic/` is a host crate. It re-includes the kernel's pure modules with
+  `#[path]` so `cargo test` compiles and checks the exact same source that runs
+  on the metal. The pure modules are the frame allocator, the heap allocator, the
+  page-table math, and the scheduler run-queue policy. None of them touch
+  hardware, `asm!`, or MMIO, so they behave identically on host and target.
+- `sim/` is the original pure-std concepts simulator, kept as a teaching layer.
 
-The kernel is driven by a logical clock measured in ticks. On each tick the
-kernel admits arriving processes, wakes sleepers, runs a scheduler maintenance
-pass, dispatches a process if the CPU is free, and executes one unit of work.
-Every one of these steps is a pure function of the current state. There is no
-wall-clock time, no threads, and no hidden global state.
+The single source of truth is `kernel/src/`. The host tests never fork the code.
 
-The only source of randomness is a seeded splitmix64 PRNG, and it is used solely
-to generate reproducible workloads before the run begins. The kernel loop itself
-contains no randomness. As a result a seed and a workload script together fix the
-entire run. This is what makes the determinism gate possible and what makes the
-model a stable object to reason about.
+## Boot flow
 
-## Module map
+QEMU loads the kernel ELF at `0x4008_0000` and begins at `_start`, defined in
+`kernel/src/boot.rs` as `global_asm!` placed in the `.text.boot` section by
+`linker.ld`.
 
-- `prng` a seeded splitmix64 generator for reproducible workloads
-- `process` the process control block and lifecycle state
-- `workload` the instruction model and the random workload generator
-- `scheduler` the scheduling trait and the three policies
-- `memory` page tables, the frame allocator, demand paging and replacement
-- `ipc` blocking message passing over mailboxes
-- `fs` the inode-based in-memory filesystem
-- `syscall` the syscall set, syscall numbers and the log record
-- `kernel` the clock and the loop that ties every subsystem together
+1. Secondary cores are parked. Only the core with affinity 0 continues.
+2. The code reads `CurrentEL`. QEMU may enter at EL2 on a CPU that has the
+   virtualization extension. If so, the kernel configures `HCR_EL2` for an
+   AArch64 EL1, lets EL1 use the physical timer through `CNTHCTL_EL2`, sets a
+   sane `SCTLR_EL1`, and performs an `eret` down to EL1h. If QEMU already entered
+   at EL1 this step is skipped.
+3. FP and SIMD access is enabled in `CPACR_EL1`. The Rust compiler emits SIMD and
+   floating-point register uses, which otherwise trap as exception class 0x07.
+4. The exception vector table address is written to `VBAR_EL1`.
+5. The stack pointer is set to the top of the reserved boot stack, and BSS is
+   zeroed.
+6. Control transfers to `kernel_main` in `kernel/src/main.rs`.
 
-## The process model
+The linker script reserves, after the loaded sections, a 4 MiB heap, a 1 MiB boot
+stack, and a 32 MiB physical frame pool, and exports symbols that the kernel
+reads at runtime to size its allocators.
 
-A process is described by a process control block. It carries a pid, a human
-readable name, a lifecycle state, a base priority where lower numbers are more
-urgent, a register file held purely as data, the program it runs, its arrival
-tick, and runtime accounting for CPU time, wait time, first run, finish time and
-dispatch count.
+## Exception model
 
-The lifecycle states are ready, running, blocked and terminated. A process that
-has not yet reached its arrival tick is held in the blocked state so it is never
-mistaken for a runnable process. On arrival it becomes ready. When dispatched it
-becomes running. A blocking syscall moves it to blocked, and completion moves it
-to terminated.
+`kernel/src/exceptions.rs` defines the vector table as sixteen entries, each
+aligned to 128 bytes, with the table aligned to 2 KiB, exactly as the
+architecture requires. Each entry branches to a stub.
 
-A program is a list of operations. A compute operation burns CPU ticks. Every
-other operation is a syscall that takes no CPU time but may change state. The
-register file is saved and restored across context switches to demonstrate the
-mechanics, and receive values from IPC and file reads are written into it.
+Two save and restore macros bracket every handled exception. `SAVE_CTX` pushes
+`x0` through `x30`, then `ELR_EL1` and `SPSR_EL1`, onto the current stack as a
+`TrapFrame`. `RESTORE_CTX` pops it back and the handler ends with `eret`. The
+`TrapFrame` is `#[repr(C)]` and its field order matches the assembly exactly, so
+Rust handlers can read and write saved registers directly.
 
-## The kernel loop
+There are two live handlers. The IRQ handler from EL1h saves context, calls the
+Rust IRQ dispatcher, switches to the stack pointer that dispatcher returns, then
+restores and returns. The synchronous handler from EL1h reads `ESR_EL1`, routes
+an `SVC` to the syscall dispatcher, and treats anything else as a fault. The
+fault path decodes the exception class, prints `ESR_EL1`, `FAR_EL1`, `ELR`, and
+`SPSR`, and halts. All other vector slots route to that same fault printer.
 
-`Kernel::step` advances exactly one tick and pushes exactly one timeline entry.
-The loop first admits any process whose arrival tick has come, in a deterministic
-order sorted by arrival then pid. It then wakes any sleeper whose deadline has
-passed. It runs the scheduler maintenance pass, which is where MLFQ applies its
-periodic boost.
+Because the entire saved context of a task is a `TrapFrame` on the task's own
+stack, a handler that returns a different stack pointer performs a context
+switch. This single idea powers both preemption and cooperative yielding.
 
-If no process is running the loop asks the scheduler for the next process and a
-quantum, marks it running, records first run and counts a context switch when the
-chosen process differs from the one that ran last. It then executes the running
-process up to its next compute unit. Syscalls encountered on the way run
-immediately and take no tick. If the process blocks, yields or exits, the loop
-releases the CPU and tries to dispatch another process in the same tick, which is
-what keeps the CPU busy whenever runnable work exists. When a compute unit runs,
-one tick is charged, the quantum is decremented, and the tick ends. If the
-process finished its program it terminates. If the quantum reached zero it is
-preempted and handed back to the scheduler.
+## Memory management
 
-Each timeline entry records the tick, the process on the CPU or none for idle,
-the number of processes still waiting, and a dispatch identifier. Ticks that
-share a dispatch identifier belong to one uninterrupted time slice, which is what
-lets the gate measure slice length precisely.
+### MMU
 
-## Scheduling policies
+`kernel/src/mmu.rs` builds one level-1 translation table of 512 entries, each a
+1 GiB block, and installs it in `TTBR0_EL1`. The map is identity, so virtual
+equals physical. Block 0 covers the device region below 1 GiB, which holds the
+UART and the GIC, and is marked device memory and execute-never. Blocks 1 to 3
+cover RAM as normal cacheable inner-shareable memory. `MAIR_EL1` defines a normal
+write-back attribute and a device nGnRnE attribute. `TCR_EL1` selects a 4 KiB
+granule and a 39-bit address space, which is why translation starts at level 1.
+After the table, TLBs, `MAIR`, and `TCR` are in place, the kernel sets the M, C,
+and I bits in `SCTLR_EL1` to enable translation and both caches.
 
-All policies implement one trait. The kernel only ever calls admit, next,
-preempt, yielded, age and ready_len, so policies are fully interchangeable.
+The descriptor construction and the per-level index math live in the pure
+`ptable` module so they are unit-tested on the host.
 
-Round robin keeps a single FIFO queue and hands out a fixed quantum. A process
-that uses its whole slice goes to the back of the queue. This gives every process
-an equal share and cannot starve anyone.
+### Frame allocator
 
-Preemptive priority selects the most urgent waiting process, breaking ties by
-longer wait and then by lower pid so the choice is deterministic. To stop a
-stream of urgent work from starving a low priority process forever, a waiting
-process earns a temporary priority bonus that grows with how long it has waited.
-This is aging. After enough waiting even a low priority process becomes the most
-urgent choice and runs.
+`kernel/src/frame_alloc.rs` is a bitmap allocator over a contiguous physical
+region carved into 4 KiB frames. The bitmap storage is supplied by the caller,
+which keeps the type free of global state and lets the host tests drive it over
+an ordinary slice. It hands out frame-aligned addresses, refuses double frees,
+and tracks used and free counts. The kernel wires it to the linker frame pool in
+`kernel/src/mem.rs`.
 
-The multi-level feedback queue keeps several queues, each with its own quantum.
-New processes enter the top queue, which has the shortest quantum. A process that
-uses its whole slice is demoted to the next queue down, which has a longer
-quantum, so CPU-bound work sinks while interactive work that yields early stays
-near the top and responsive. On its own this could starve the bottom queue, so
-every boost interval the scheduler lifts every process back to the top queue.
-That boost is the mechanism that guarantees no process starves under MLFQ.
+### Heap
 
-## Virtual memory and paging
+`kernel/src/heap.rs` is a first-fit free-list allocator with address-ordered
+coalescing. Free regions are an intrusive linked list sorted by address, with
+each node stored inside the free memory it describes. Every live allocation is
+prefixed by a small header that records the exact block extent, so a free
+reconstructs precisely what the allocation consumed. That makes byte accounting
+exact and lets adjacent frees merge back into one region. The kernel wraps it in
+a spinlock and registers it as the `#[global_allocator]`, so `Box`, `Vec`, and
+`String` work. A stress test on the host allocates and frees thousands of blocks
+in random order and asserts that nothing leaks and the arena coalesces back to a
+single region.
 
-Physical memory is a fixed set of frames, each one page in size. Every process
-has its own page table mapping virtual page numbers to frames. A virtual address
-splits into a page number and an offset. Translation looks up the page number in
-the calling process page table and, if the page is resident, returns the frame
-times the page size plus the offset.
+## Interrupts and the timer
 
-Memory is demand paged. Touching a page that is not resident raises a page fault.
-The fault handler allocates a frame, taking a free one if available or evicting a
-victim if memory is full, and pages the content in from a per-process backing
-store. A page that has never been written pages in as zeros. When a frame is
-evicted its contents are written back to the backing store first, so a value
-written to a virtual address always reads back the same even after its page has
-been evicted and later reloaded.
+`kernel/src/gic.rs` initializes the GICv2 on `virt`, the distributor at
+`0x0800_0000` and the CPU interface at `0x0801_0000`. It enables the distributor
+and the CPU interface, sets the priority mask to accept everything, and exposes
+enable, acknowledge, and end-of-interrupt.
 
-A private frame is owned by exactly one process-and-page pair. The allocator
-never hands the same frame to two private mappings, which is the aliasing
-invariant. Shared memory is the single explicit exception. `Memory::share` maps a
-second process page to an existing frame and marks that frame shared, which is
-how two processes deliberately see the same bytes.
+`kernel/src/timer.rs` programs the EL1 physical timer. It reads `CNTFRQ_EL0`,
+computes an interval for a 100 Hz tick, loads `CNTP_TVAL_EL0`, enables
+`CNTP_CTL_EL0`, and enables the timer PPI, which on `virt` is interrupt id 30.
+On each interrupt the handler reloads the countdown and increments a tick
+counter. That tick is the heartbeat of preemption.
 
-Three replacement policies choose the victim when memory is full. FIFO evicts the
-frame loaded earliest. LRU evicts the frame whose last access is oldest. Clock is
-the second-chance approximation of LRU, sweeping a hand around the frames and
-giving a referenced frame one more chance before evicting it. Only private
-frames are eviction candidates, and shared frames are pinned.
+## Scheduler and context switch
+
+The scheduling policy is pure and lives in `kernel/src/runqueue.rs`. It tracks a
+fixed set of task slots, each Ready, Running, Blocked, or Exited, and rotates
+round-robin over the runnable ones, skipping blocked and exited tasks. It is
+exercised directly by host tests for fairness, for the invariant that exactly one
+task runs at a time, for skipping and resuming blocked tasks, and for never
+scheduling an exited task.
+
+The machine half lives in `kernel/src/sched.rs`. Each task has a control block
+holding its saved stack pointer. A new task gets a stack from a static pool and
+an initial `TrapFrame` synthesized at the top of that stack, with the entry point
+in `ELR`, interrupts unmasked in `SPSR`, and a return trampoline in the link
+register. Task 0 is the boot context itself, and its saved stack pointer is
+filled in on the first switch away from it.
+
+A context switch is a stack-pointer swap. On a timer IRQ the handler saves the
+outgoing task's context onto its stack, calls the run-queue to pick the next
+task, and returns that task's saved stack pointer, which the assembly installs
+before restoring and `eret`. The exact same path runs for a cooperative `yield`
+syscall, since taking the `SVC` exception also masks interrupts. Task-context
+code that reads scheduler state does so with interrupts masked, so a timer
+interrupt can never deadlock against a lock the interrupted task holds.
 
 ## Syscalls
 
-Process operations that are not plain compute are modeled as syscalls into the
-kernel. The set is spawn, exit, yield, sleep, read, write, map, ipc_send and
-ipc_recv. Each has a stable syscall number as it would in a real dispatch table.
-The kernel executes each syscall against the relevant subsystem and appends a
-record to the syscall log with the tick, the caller, the call and its outcome,
-where the outcome is continue, blocked or exited.
+`kernel/src/syscall.rs` defines the `SVC` interface. A task issues `svc #0` with
+the syscall number in `x8` and arguments in `x0` and up. The synchronous handler
+routes it here. `write` copies bytes to the UART and returns the length.
+`gettime` returns the tick count. `yield` switches tasks. `exit` marks the task
+exited and switches away, and if the boot task exits it powers the machine off.
+User-side wrappers issue the `svc` and read the result back from `x0`.
 
-## IPC
+Shutdown uses Arm semihosting `SYS_EXIT` with the application-exit reason and a
+zero code, which makes QEMU exit with status 0. That is what turns a clean
+kernel shutdown into a passing boot test.
 
-Inter-process communication is blocking message passing over mailboxes. A
-mailbox holds an ordered queue of values and an ordered queue of blocked
-receivers. A send appends a value and, if a receiver is waiting, reports it so
-the kernel can wake it. A receive on a non-empty mailbox returns the oldest
-value. A receive on an empty mailbox blocks the caller and records it as a
-waiter. Wakeups are FIFO, so the longest-waiting receiver is served first.
+## The shell
 
-## Filesystem
+`kernel/src/shell.rs` reads a line from the UART with backspace editing, parses
+it, and runs a built-in. The same `exec` dispatcher is used both by the live
+interactive loop and by the startup demo, so the commands are real either way.
+The commands report live kernel state: `ps` reads the scheduler, `uptime` reads
+the timer, and `mem` reads the heap and frame allocator.
 
-The filesystem is a small inode model with a single root directory. An inode is
-either a directory, which maps names to inode numbers, or a file, which holds a
-byte buffer. Paths are absolute and slash separated. A process opens a path to
-get a descriptor that tracks the inode, a current offset and whether writes are
-allowed, then reads, writes and closes it. Directory listings are sorted so the
-output is deterministic.
+## How the boot test proves correctness
 
-## Why each gate proves its claim
+For a real kernel, the proof is that it boots and runs on the machine, so the
+correctness gate is a boot in QEMU, not a simulation. `scripts/boot-test.sh`
+builds the kernel in release, boots it headless under QEMU with a hard timeout,
+pipes a short shell session over the UART, and captures all console output. It
+then asserts the markers that can only appear if each subsystem worked:
 
-The gate is a set of tests bounded for CI, with fuzzing depth set by the
-`AURORA_FUZZ_OPS` environment variable.
+- the boot banner, which means the kernel reached Rust and the UART works,
+- MMU enabled, which means translation came on without faulting,
+- the heap and frame markers, which means both allocators ran,
+- the timer marker, which means an IRQ actually fired through the GIC,
+- both task markers plus an interleaving check, which means the scheduler
+  switched contexts back and forth rather than running one task to completion,
+- a syscall round-trip marker, which means an `SVC` returned a value,
+- the interactive shell banner and its responses to piped commands,
+- a clean power-off, which means the machine exited through semihosting.
 
-Scheduler invariants. The no-starvation test runs many random workloads under
-every policy and asserts that every process reaches the terminated state and ran
-at least once. If any policy could starve a process the run would never converge
-and the assertion would fire. This is exactly the property MLFQ aging exists to
-provide. The idle-and-accounting test steps the kernel one tick at a time and
-asserts that no idle tick coexists with a ready process, and that the sum of
-per-process CPU time equals the number of busy ticks, which proves the CPU is
-never wasted and that time accounting is exact. The quantum test groups the
-timeline by dispatch identifier and asserts that no single dispatch exceeds its
-quantum, which proves slice boundaries are honored. FIFO fairness is proven
-directly by a unit test on the round robin queue.
+It also fails on any printed CPU exception or panic, and it fails if QEMU exits
+non-zero, which includes a timeout. The host `cargo test` layer complements this
+by checking the allocator and scheduler invariants that are painful to observe
+from the outside, using the same source the kernel runs.
 
-Virtual memory correctness. The round-trip test writes random bytes to a working
-set far larger than the number of frames, forcing repeated eviction, then reads
-every address back and asserts the value matches, which proves translation and
-the backing store are correct under pressure. It also asserts eviction actually
-happened so the test is not vacuous. The aliasing test runs full kernels and
-asserts no private frame appears in two live mappings. The fault test asserts a
-page reports absent before its first touch, a fault is raised on that touch, the
-page is resident afterward, and the resident set never exceeds the physical frame
-count. Together they prove faults fire exactly when they should and replacement
-frees frames correctly.
+## The concepts layer
 
-Determinism. The determinism test runs the same seed and workload twice for every
-policy and replacement pairing and asserts the timeline, context switch count,
-syscall log, fault log, live memory map and every per-process value are equal.
-Because the loop is a pure function of state and the only randomness is the seed,
-the two runs must agree bit for bit, and the test fails the moment any hidden
-nondeterminism creeps in.
+The `sim/` crate is the original Aurora, a deterministic pure-std model of kernel
+mechanics that runs in-process, can be stepped one tick at a time, and powers the
+browser playground in `docs/`. It cannot boot, but it is easy to read and it has
+its own correctness gates for scheduling, translation, and determinism. The real
+kernel reimplements the core of those ideas on hardware.

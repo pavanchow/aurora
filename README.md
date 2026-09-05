@@ -1,106 +1,145 @@
 # Aurora
 
-Aurora is a deterministic operating-system kernel simulator written in pure
-Rust with zero external dependencies (std only, edition 2021).
+Aurora is a real, bootable aarch64 (ARM64) operating-system kernel written in
+Rust. It is `no_std`, `no_main`, has zero external crate dependencies, and boots
+on the QEMU `virt` machine where it brings up virtual memory, interrupts, a
+preemptive scheduler, syscalls, and an interactive shell over the serial port.
 
-A bootable `no_std` kernel cannot be unit tested in CI or run inside a web
-browser, so it is hard to learn from and hard to trust. Aurora takes the other
-road. It is a faithful, deterministic model of the real mechanisms inside a
-kernel, running as an ordinary in-process simulation you can step, test and
-visualize. It is a teaching-accurate model of kernel mechanics, not a bootable
-operating system.
+This is not a simulation. The code in `kernel/` is the code the CPU executes at
+EL1. You build it for `aarch64-unknown-none`, QEMU loads the ELF at
+`0x4008_0000`, and the machine runs it.
 
-Live playground: https://pavanchow.github.io/aurora/
+The repository also keeps the original Aurora concepts layer, a pure-`std`
+deterministic kernel simulator, under `sim/` for teaching and for a browser
+playground. The real kernel is the priority.
 
-## What it models
+## What the kernel does
 
-- Processes and threads. A process control block with a pid, a lifecycle state
-  (ready, running, blocked, terminated), registers held as data, a base
-  priority, and full CPU-time and wait-time accounting. Context switches are
-  counted.
-- Scheduling. Three interchangeable policies behind one trait: round robin with
-  a quantum, preemptive priority with aging, and a multi-level feedback queue
-  (MLFQ) with periodic priority boosting to prevent starvation.
-- Virtual memory. Per-process page tables, a physical frame allocator,
-  virtual-to-physical translation, page faults with demand paging, a per-process
-  backing store, and a choice of FIFO, LRU or clock page replacement.
-- Syscalls. A dispatch layer for spawn, exit, read, write, sleep, yield, map,
-  ipc_send and ipc_recv.
-- IPC. Blocking message passing over mailboxes, with FIFO wakeups.
-- Filesystem. A small inode-based in-memory filesystem with directories, files
-  and open, read, write, close.
-- A deterministic clock, a seeded PRNG for reproducible random workloads, and a
-  CLI that runs a workload and prints the scheduling timeline, memory and frame
-  state, and the syscall log.
+- Boots from a hand-written assembly entry point: parks secondary cores, drops
+  from EL2 to EL1 if QEMU started it there, sets up the stack, zeroes BSS,
+  enables FP/SIMD, and jumps into Rust.
+- Drives a PL011 UART (MMIO `0x0900_0000`) for `print!`/`println!` and line
+  input.
+- Installs a full aarch64 exception vector table in `VBAR_EL1`, with handlers
+  for synchronous exceptions and IRQs and ESR_EL1 fault decoding on a crash.
+- Turns on the MMU with real translation tables in `TTBR0_EL1`: an identity map
+  of 1 GiB blocks, device memory below 1 GiB and normal cacheable RAM above,
+  with data and instruction caches enabled.
+- Manages memory with a physical frame allocator and a kernel heap behind its
+  own `#[global_allocator]`, a first-fit free-list allocator with coalescing, so
+  `Box`, `Vec` and `String` from the built-in `alloc` crate work.
+- Initializes the GICv2 interrupt controller and the ARM generic timer, which
+  raises a periodic IRQ at 100 Hz.
+- Runs multiple kernel tasks under a preemptive round-robin scheduler. The
+  context switch is written in aarch64 assembly and is driven by the timer tick.
+- Provides syscalls through the `SVC` instruction: write, yield, gettime, exit.
+- Runs a small interactive shell over the UART with `help`, `ps`, `uptime`,
+  `mem`, `echo` and `exit`.
 
 ## The gap it fills
 
-If you are a person or an AI agent learning how a kernel actually works, you
-usually get one of two things: prose that cannot be run, or a real kernel that
-cannot be inspected tick by tick. Aurora gives you a runnable, inspectable,
-fully deterministic model. You can set a seed, run a workload, read the exact
-scheduling timeline and the exact frame that each page landed in, then change a
-policy and rerun to compare. Because it is deterministic, the same seed always
-produces the same answer, which makes it a stable thing to reason about and to
-test against.
+Most teaching kernels are either prose you cannot run or a real kernel with no
+way to prove it actually worked. Aurora pairs a genuine bootable kernel with a
+correctness gate that boots it in QEMU and asserts, from the captured serial
+output, that every subsystem ran: the banner printed, the MMU came on, the timer
+IRQ fired, two tasks made interleaved progress, a syscall completed, and the
+machine powered off cleanly. If any of that is missing the gate fails.
 
-## Quickstart
+## Requirements (macOS)
 
-```
-cargo run --release -- demo          # curated scheduling + paging + IPC walkthrough
-cargo run --release -- run --seed 7 --tasks 6 --policy mlfq --replace lru
-cargo test                           # unit tests plus the correctness gate
-```
+- Rust (stable). Add the bare-metal target:
 
-The `run` options are `--seed`, `--tasks`, `--frames`, `--policy`
-(`rr`, `priority`, `mlfq`), `--replace` (`fifo`, `lru`, `clock`) and `--max`.
+  ```sh
+  rustup target add aarch64-unknown-none
+  ```
 
-## API
+- QEMU (no sudo needed):
 
-```rust
-use aurora::{Kernel, Workload};
-use aurora::scheduler::Policy;
-use aurora::memory::Replacement;
+  ```sh
+  brew install qemu
+  ```
 
-let workload = Workload::generate(7, 6, 6); // seed, tasks, frames
-let mut kernel = Kernel::new(&workload, Policy::Mlfq.build(), Replacement::Lru);
-kernel.run(100_000);
+Linux is the same minus the QEMU install, which is `apt-get install -y
+qemu-system-arm` (provides `qemu-system-aarch64`).
 
-println!("{}", kernel.gantt());
-println!("faults: {}", kernel.memory.faults);
+## Build
+
+```sh
+cd kernel
+cargo build --release
 ```
 
-You can also build an explicit workload from `aurora::Task` and `aurora::Op`,
-step the kernel one tick at a time with `kernel.step()`, and read the timeline
-from `kernel.timeline`.
+The kernel ELF lands at
+`kernel/target/aarch64-unknown-none/release/aurora-kernel`.
 
-## The correctness gate
+## Run
 
-The gate lives in `tests/gates.rs` and proves the three claims Aurora makes.
-It is bounded for CI and the amount of fuzzing is set by `AURORA_FUZZ_OPS`.
+From the `kernel/` directory, a cargo runner launches QEMU for you:
 
-1. Scheduler invariants. Over random workloads every process eventually runs
-   and terminates (no starvation, MLFQ relies on aging for this), the CPU is
-   never idle while a runnable process exists, no dispatch runs longer than its
-   quantum, and total CPU time equals the number of busy ticks.
-2. Virtual memory correctness. A write then a read through translation returns
-   the same value even under eviction pressure, no two distinct live private
-   mappings alias the same frame (shared memory is the only exception), page
-   faults are raised exactly on unmapped or evicted pages, and replacement keeps
-   the resident set within the physical frame count.
-3. Determinism. The same seed and workload produce an identical timeline and
-   memory image, bit for bit, across every policy and replacement pairing.
-
-```
-AURORA_FUZZ_OPS=4000 cargo test        # deeper fuzzing
+```sh
+cd kernel
+cargo run --release
 ```
 
-## Design
+Or invoke QEMU directly:
 
-See [DESIGN.md](DESIGN.md) for the architecture, each scheduler policy, the
-virtual-memory and paging model, syscalls, IPC, the filesystem, the
-deterministic-simulation approach, and why each gate proves its claim.
+```sh
+qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512 -nographic -semihosting \
+  -kernel kernel/target/aarch64-unknown-none/release/aurora-kernel
+```
 
-## License
+The kernel boots, runs its startup demo (allocators, timer, two interleaving
+tasks, a syscall round-trip), then drops you at the `aurora>` prompt. To leave
+QEMU, type `exit` (the kernel powers the machine off), or press `Ctrl-A` then
+`X`.
 
-MIT.
+### Shell commands
+
+| command       | effect                                        |
+| ------------- | --------------------------------------------- |
+| `help`        | list the commands                             |
+| `ps`          | list tasks and their scheduler states         |
+| `uptime`      | time since boot, in ms and timer ticks        |
+| `mem`         | heap bytes used/free and physical frame usage |
+| `echo <text>` | print the text back                           |
+| `exit`        | power the machine off cleanly                  |
+
+## Test
+
+Two layers, both run in CI.
+
+Boot test (the real correctness gate). Builds the kernel, boots it headless in
+QEMU with a hard timeout, and asserts the serial markers that prove it ran:
+
+```sh
+./scripts/boot-test.sh
+```
+
+Host unit tests for the pure logic that can be checked without hardware, the
+frame allocator, the heap allocator invariants, the page-table index math, and
+the scheduler run-queue policy. These modules are the exact source the kernel
+compiles, pulled into a host crate so `cargo test` exercises the same code:
+
+```sh
+cargo test          # runs the aurora-logic and sim tests on the host
+```
+
+## Repository layout
+
+```
+kernel/     the real no_std aarch64 kernel (boot, MMU, GIC, timer, scheduler, syscalls, shell)
+logic/      host crate that re-includes the kernel's pure modules for cargo test
+sim/        the original pure-std kernel simulator (concepts layer)
+scripts/    boot-test.sh, the QEMU boot correctness gate
+docs/       the browser playground for the simulator
+DESIGN.md   how the kernel boots and how the boot test proves it works
+```
+
+## The concepts layer
+
+The `sim/` crate is the original Aurora: a deterministic, dependency-free model
+of kernel mechanics (processes, three schedulers, virtual memory with page
+replacement, syscalls, IPC, a small filesystem) that you can step one tick at a
+time and inspect field by field. It cannot boot, but it is easy to read and it
+powers the live playground at https://pavanchow.github.io/aurora/. The real
+kernel reimplements the core of these ideas on actual hardware.
