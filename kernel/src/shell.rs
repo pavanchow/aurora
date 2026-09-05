@@ -59,6 +59,9 @@ pub fn exec(line: &str) -> bool {
             println!("  vault put <k> <v>    store a secret encrypted in RAM");
             println!("  vault get <k>        decrypt and show a secret");
             println!("  vault list           list stored secret names");
+            println!("  cap net              grant the revocable network capability");
+            println!("  cap revoke net       revoke the network capability");
+            println!("  net <msg>            round-trip a message over CAP_NET (needs CAP_NET)");
             println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
             println!("  panic                trigger a kernel panic (wipes on the way down)");
@@ -161,8 +164,19 @@ pub fn exec(line: &str) -> bool {
             Some("vault") => {
                 syscall::sys_request_cap(session::CAP_VAULT);
             }
-            _ => println!("usage: cap <net|vault>"),
+            Some("revoke") => match parts.next() {
+                Some("net") => {
+                    session::revoke_capability(session::CAP_NET);
+                }
+                _ => println!("usage: cap revoke net"),
+            },
+            _ => println!("usage: cap <net|vault|revoke net>"),
         },
+        "net" => {
+            let rest = line.strip_prefix("net").unwrap_or("").trim();
+            let msg = if rest.is_empty() { "aurora-agent-task" } else { rest };
+            crate::net::shell_roundtrip(msg);
+        }
         "el0test" => {
             crate::isolation::run_el0_probe();
         }

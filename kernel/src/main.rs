@@ -22,6 +22,7 @@ mod heap;
 mod isolation;
 mod kindling;
 mod mem;
+mod net;
 mod mmu;
 mod persistence;
 mod ptable;

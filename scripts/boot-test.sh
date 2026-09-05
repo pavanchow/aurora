@@ -64,6 +64,9 @@ shell_script() {
     # Parameterized compute: two different inputs -> two different outputs.
     printf 'compute 40 + 2\n'
     printf 'compute 6 * 7 - 1\n'
+    # Connectivity: grant the revocable network cap and round-trip a task.
+    printf 'cap net\n'
+    printf 'net aurora-agent-task-01\n'
     # Multi-line Kindling program: sum of primes below 1000 (=76127), then
     # factor 561 and check Korselt's criterion (Carmichael number).
     printf 'compute\n'
@@ -83,6 +86,8 @@ shell_script() {
 shell_script | \
     run_with_timeout "$TIMEOUT_SECS" \
         "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
         -kernel "$ELF" >"$OUT" 2>&1
 QEMU_RC=$?
 
@@ -151,6 +156,13 @@ require "561 Carmichael verdict"   "561 is a Carmichael number"
 require "EL0 legit syscall works"  "EL0 user task ran a legit 'write' syscall"
 require "EL0 faults on vault"      "EL0 fault: data abort"
 require "EL0 access denied"        "DENIED: EL0 cannot read kernel/vault RAM"
+
+# Connectivity: virtio-net comes up, negotiates VERSION_1, and does a real
+# request/response round trip over QEMU user-net (ARP + ICMP echo).
+require "virtio-net negotiated"    "negotiated VERSION_1"
+require "NIC is up"                "[net] up: MAC"
+require "ARP round trip"           "ARP reply: gateway is at"
+require "ICMP echo round trip"     "round trip complete: sent a task and received the result back"
 
 require "clean shutdown"         "[shutdown] powering off"
 

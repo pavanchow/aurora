@@ -9,5 +9,8 @@ runner = [
     "-m", "512",
     "-nographic",
     "-semihosting",
+    "-global", "virtio-mmio.force-legacy=false",
+    "-netdev", "user,id=n0",
+    "-device", "virtio-net-device,netdev=n0",
     "-kernel",
 ]

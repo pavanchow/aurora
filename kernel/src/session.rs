@@ -25,7 +25,9 @@ pub const CAP_TIME: u32 = 1 << 3;
 pub const CAP_NET: u32 = 1 << 4;
 
 const DEFAULT_CAPS: u32 = CAP_VAULT | CAP_COMPUTE | CAP_MSG | CAP_TIME;
-const GRANTABLE: u32 = DEFAULT_CAPS; // everything except CAP_NET
+// CAP_NET is grantable but off by default: the trace-free posture holds unless a
+// session explicitly asks for the network, and it can be revoked again.
+const GRANTABLE: u32 = DEFAULT_CAPS | CAP_NET;
 
 const MSG_SLOTS: usize = 8;
 const MSG_MAX: usize = 64;
@@ -143,12 +145,29 @@ pub fn request_capability(cap: u32) -> bool {
         return false;
     }
     if cap & !GRANTABLE != 0 {
-        println!("[cap] denied: {:#07b} is not grantable (no network on Aurora)", cap);
+        println!("[cap] denied: {:#07b} is not grantable", cap);
         return false;
     }
     s.caps |= cap;
     println!("[cap] granted {:#07b}, session caps now {:#07b}", cap, s.caps);
     true
+}
+
+/// Revoke a capability from the current session (CAP_NET is revocable).
+pub fn revoke_capability(cap: u32) -> bool {
+    let mut s = SESSION.lock();
+    if !s.active {
+        println!("[cap] no active session");
+        return false;
+    }
+    s.caps &= !cap;
+    println!("[cap] revoked {:#07b}, session caps now {:#07b}", cap, s.caps);
+    true
+}
+
+/// Whether the current session holds CAP_NET.
+pub fn has_net() -> bool {
+    has_cap(CAP_NET)
 }
 
 /// Store a secret in the encrypted vault. Prints the ciphertext, never the value.
@@ -297,8 +316,7 @@ pub fn run_task(name: &str) -> bool {
         "caps" => {
             let c = SESSION.lock().caps;
             println!("  -> caps = {:#07b} (bit0 vault, bit1 compute, bit2 msg, bit3 time, bit4 net)", c);
-            // Show the deny path: network is never grantable on Aurora.
-            let _ = request_capability(CAP_NET);
+            println!("  -> CAP_NET is off by default; grant it with 'cap net', revoke with 'cap revoke net'");
             true
         }
         _ => {
