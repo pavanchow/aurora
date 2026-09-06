@@ -54,6 +54,12 @@ pub mod uaccess;
 #[path = "../../kernel/src/runqueue.rs"]
 pub mod runqueue;
 
+// The bounded shell-history ring, mounted from the exact kernel source so
+// `cargo test` exercises the same cap logic the kernel runs. It is pure (no
+// `asm!`, no MMIO) and uses `alloc::` paths, so it builds on the host.
+#[path = "../../kernel/src/history.rs"]
+pub mod history;
+
 // The embedded Kindling bytecode runtime, mounted from the exact kernel source
 // so `cargo test` exercises the same interpreter the kernel runs. `alloc` is
 // available on the host and the vendored modules use `alloc::` paths.
