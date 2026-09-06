@@ -321,6 +321,35 @@ impl Gen {
     }
 }
 
+/// Generate a program that defines a function of a random declared arity and
+/// calls it with a possibly-different number of arguments, so the differential
+/// gate exercises arity match (runs) and arity mismatch (both evaluators must
+/// error identically). The call is under-, exactly-, or over-supplied roughly in
+/// thirds. Regression for the missing call-arity check.
+pub fn random_arity_program(seed: u64) -> String {
+    let mut rng = Rng::new(seed);
+    let declared = rng.below(4); // 0..=3 declared params
+    let supplied = match rng.below(3) {
+        0 => declared.saturating_sub(1 + rng.below(declared.max(1))), // too few (or exact when declared==0)
+        1 => declared,                                                // exact
+        _ => declared + 1 + rng.below(3),                             // too many
+    };
+    let params: Vec<String> = (0..declared).map(|i| format!("p{i}")).collect();
+    let body = if declared == 0 {
+        "0".to_string()
+    } else {
+        params.join(" + ")
+    };
+    let args: Vec<String> = (0..supplied)
+        .map(|_| rng.range_i64(0, 20).to_string())
+        .collect();
+    format!(
+        "fn f({}) {{ return {body}; }} return f({});",
+        params.join(", "),
+        args.join(", ")
+    )
+}
+
 /// Generate one random program. `ops` scales how many statements and how deep
 /// the expressions get (driven by the `KINDLING_FUZZ_OPS` env var in tests).
 pub fn random_program(seed: u64, ops: usize) -> String {

@@ -7,7 +7,7 @@
 //! machine-checkable oracle. Program count is controlled by `KINDLING_FUZZ_OPS`
 //! (default 500).
 
-use aurora_logic::kref::gen::random_program;
+use aurora_logic::kref::gen::{random_arity_program, random_program};
 use aurora_logic::{eval_reference, run_kindling};
 
 fn program_count() -> u64 {
@@ -56,6 +56,45 @@ fn vm_matches_reference_interpreter() {
     }
     assert_eq!(checked, count);
     eprintln!("differential: {checked} programs, VM == reference on all");
+}
+
+#[test]
+fn vm_and_reference_agree_on_call_arity() {
+    // Mutate call-site argument counts versus the callee's declared arity (too
+    // few, exact, too many). The VM and the reference interpreter must AGREE: an
+    // exact match runs and yields the same value; any mismatch is the same error
+    // in both. This is the regression for the missing call-arity check that let
+    // too-few args panic the kernel and let a missing arg stale-read.
+    let count = program_count();
+    let mut saw_ok = false;
+    let mut saw_err = false;
+    for seed in 0..count {
+        let src = random_arity_program(seed);
+        match (run_kindling(&src), eval_reference(&src)) {
+            (Ok(v), Ok(r)) => {
+                assert_eq!(v.0, r.0, "seed {seed}: value mismatch\n{src}");
+                saw_ok = true;
+            }
+            (Err(ve), Err(re)) => {
+                assert_eq!(ve, re, "seed {seed}: error mismatch\nVM={ve:?} REF={re:?}\n{src}");
+                assert!(
+                    ve.contains("wrong number of arguments"),
+                    "seed {seed}: unexpected error {ve:?}\n{src}"
+                );
+                saw_err = true;
+            }
+            (Ok(v), Err(re)) => panic!(
+                "seed {seed}: VM produced {:?} but reference trapped {re:?}\n{src}",
+                v.0
+            ),
+            (Err(ve), Ok(r)) => panic!(
+                "seed {seed}: VM trapped {ve:?} but reference produced {:?}\n{src}",
+                r.0
+            ),
+        }
+    }
+    assert!(saw_ok, "generator never produced a matching-arity call");
+    assert!(saw_err, "generator never produced a mismatching-arity call");
 }
 
 #[test]
