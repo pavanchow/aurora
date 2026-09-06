@@ -489,6 +489,30 @@ fn cntpct() -> u64 {
     v
 }
 
+/// The ARM generic-timer frequency in Hz: cntpct ticks per second. Used to turn
+/// the wall-clock receive deadline (in seconds) into an absolute tick count.
+#[inline]
+fn cntfrq() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+// A single fetch operation gets a generous absolute wall-clock deadline and a
+// total wire-bytes cap. Both sit far above a real fetch (which completes in well
+// under a second and a few tens of KB), so legitimate traffic never sees them,
+// but a slowloris peer that dribbles bytes to keep the per-record idle counters
+// from tripping, or floods bytes that never complete a record, aborts promptly.
+const RECV_DEADLINE_SECS: u64 = 15;
+const RECV_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Start a fresh total receive budget for one fetch operation, anchored to the
+/// current generic-timer tick.
+fn new_recv_budget() -> proto::RecvBudget {
+    let deadline = cntfrq().saturating_mul(RECV_DEADLINE_SECS);
+    proto::RecvBudget::new(cntpct(), deadline, RECV_MAX_BYTES)
+}
+
 fn in_our_subnet(ip: [u8; 4]) -> bool {
     ip[0] == OUR_IP[0] && ip[1] == OUR_IP[1] && ip[2] == OUR_IP[2]
 }
@@ -716,8 +740,18 @@ fn tcp_send(t: &Tcp, flags: u8, payload: &[u8]) -> bool {
 
 /// Poll for the next TCP segment of this connection. Copies its payload into
 /// `out` and returns `(seq, ack, flags, payload_len)`, or None on timeout.
-fn tcp_poll(t: &Tcp, out: &mut [u8]) -> Option<(u32, u32, u8, usize)> {
+fn tcp_poll(
+    t: &Tcp,
+    out: &mut [u8],
+    budget: &mut proto::RecvBudget,
+) -> Option<(u32, u32, u8, usize)> {
     for _ in 0..MAX_FRAMES_PER_POLL {
+        // The absolute per-operation deadline is checked here, at the single
+        // point every receive path funnels through, so no amount of dribbled or
+        // flooded traffic can keep the core spinning past it.
+        if budget.over_budget(cntpct()) {
+            return None;
+        }
         let rx: &mut [u8] = unsafe { &mut (*nb()).rx_scratch };
         let n = recv_frame(rx)?;
         if n < 34 || u16::from_be_bytes([rx[12], rx[13]]) != ET_IPV4 {
@@ -743,6 +777,10 @@ fn tcp_poll(t: &Tcp, out: &mut [u8]) -> Option<(u32, u32, u8, usize)> {
         let dlen = core::cmp::min(seg.data_len, out.len());
         let dstart = seg_off + seg.data_off;
         out[..dlen].copy_from_slice(&rx[dstart..dstart + dlen]);
+        // Charge every payload byte pulled off the wire, including bytes that
+        // will accumulate inside an as-yet-incomplete record, so a fast flood
+        // that never completes anything is bounded too.
+        budget.charge(dlen);
         return Some((seg.seq, seg.ack, seg.flags, dlen));
     }
     None
@@ -750,7 +788,12 @@ fn tcp_poll(t: &Tcp, out: &mut [u8]) -> Option<(u32, u32, u8, usize)> {
 
 /// Open a TCP connection with the three-way handshake. Retransmits the SYN a
 /// bounded number of times so a lost packet cannot hang the client.
-fn tcp_connect(dst_ip: [u8; 4], dst_mac: [u8; 6], dst_port: u16) -> Option<Tcp> {
+fn tcp_connect(
+    dst_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    dst_port: u16,
+    budget: &mut proto::RecvBudget,
+) -> Option<Tcp> {
     let iss = ((cntpct() as u32).wrapping_mul(2_654_435_761)) ^ 0x5f37_59df;
     let src_port = 0xC000 | (rand16() & 0x0fff);
     let mut t = Tcp {
@@ -766,7 +809,7 @@ fn tcp_connect(dst_ip: [u8; 4], dst_mac: [u8; 6], dst_port: u16) -> Option<Tcp> 
         // SYN carries one sequence number.
         t.snd_nxt = iss;
         tcp_send(&t, proto::TCP_SYN, &[]);
-        if let Some((seq, ack, flags, _)) = tcp_poll(&t, &mut scratch) {
+        if let Some((seq, ack, flags, _)) = tcp_poll(&t, &mut scratch, budget) {
             if flags & proto::TCP_RST != 0 {
                 return None;
             }
@@ -784,12 +827,12 @@ fn tcp_connect(dst_ip: [u8; 4], dst_mac: [u8; 6], dst_port: u16) -> Option<Tcp> 
 }
 
 /// Send the FIN teardown and briefly acknowledge the peer's FIN.
-fn tcp_close(t: &mut Tcp) {
+fn tcp_close(t: &mut Tcp, budget: &mut proto::RecvBudget) {
     tcp_send(t, proto::TCP_FIN | proto::TCP_ACK, &[]);
     t.snd_nxt = t.snd_nxt.wrapping_add(1);
     let mut scratch = [0u8; 64];
     for _ in 0..4 {
-        match tcp_poll(t, &mut scratch) {
+        match tcp_poll(t, &mut scratch, budget) {
             Some((seq, _ack, flags, dlen)) => {
                 if flags & proto::TCP_FIN != 0 {
                     t.rcv_nxt = seq.wrapping_add(dlen as u32).wrapping_add(1);
@@ -814,7 +857,9 @@ fn http_get(
     host: &str,
     path: &str,
 ) -> Option<(u16, usize, usize)> {
-    let mut t = tcp_connect(dst_ip, dst_mac, port)?;
+    // One absolute budget covers the whole operation: connect, receive, close.
+    let mut budget = new_recv_budget();
+    let mut t = tcp_connect(dst_ip, dst_mac, port, &mut budget)?;
 
     // Build the request. HTTP/1.0 with an explicit close: the server writes the
     // whole body then FINs, which is our clean end-of-body signal.
@@ -834,13 +879,23 @@ fn http_get(
     let mut got_fin = false;
     let mut seg = [0u8; 1600];
     loop {
-        match tcp_poll(&t, &mut seg) {
+        // Absolute deadline / byte cap: bytes arriving never reset it, so a slow
+        // dribble or a flood of out-of-order segments (parse_tcp does no sequence
+        // validation, so the loop would otherwise spin on them) is bounded.
+        if budget.over_budget(cntpct()) {
+            println!("[net] receive deadline exceeded (connection too slow)");
+            break;
+        }
+        match tcp_poll(&t, &mut seg, &mut budget) {
             Some((seq, _ack, flags, dlen)) => {
                 idle = 0;
                 if flags & proto::TCP_RST != 0 {
                     break;
                 }
                 if dlen > 0 {
+                    // Only in-order data advances the body; an out-of-order
+                    // segment is acknowledged (to prompt retransmit) but dropped,
+                    // and the deadline above bounds any resulting spin.
                     if seq == t.rcv_nxt {
                         // In-order data: append to the body region, bounded.
                         let room = BODY_MAX.saturating_sub(total);
@@ -880,7 +935,7 @@ fn http_get(
     // Send our FIN. If the peer already FINed we still send ours for a clean
     // close; otherwise this initiates the teardown.
     let _ = got_fin;
-    tcp_close(&mut t);
+    tcp_close(&mut t, &mut budget);
 
     let resp = unsafe { &(&(*nb()).body)[..total] };
     let (status, body_off) = proto::parse_http_response(resp)?;
@@ -903,9 +958,13 @@ fn nb_tls() -> *mut TlsScratch {
 
 /// Pull one TCP segment and append in-order payload to the TLS stream buffer.
 /// Returns `(made_progress, saw_fin)`.
-fn tls_tcp_fill(t: &mut Tcp, stream_len: &mut usize) -> (bool, bool) {
+fn tls_tcp_fill(
+    t: &mut Tcp,
+    stream_len: &mut usize,
+    budget: &mut proto::RecvBudget,
+) -> (bool, bool) {
     let mut seg = [0u8; 1600];
-    match tcp_poll(t, &mut seg) {
+    match tcp_poll(t, &mut seg, budget) {
         Some((seq, _ack, flags, dlen)) => {
             if flags & proto::TCP_RST != 0 {
                 return (false, true);
@@ -941,10 +1000,26 @@ fn tls_tcp_fill(t: &mut Tcp, stream_len: &mut usize) -> (bool, bool) {
 
 /// Read exactly one TLS record into `nb().tls.rec`, consuming it from the stream
 /// buffer. Returns the record length, or None on close/timeout/oversize.
-fn tls_read_record(t: &mut Tcp, stream_len: &mut usize) -> Option<usize> {
+fn tls_read_record(
+    t: &mut Tcp,
+    stream_len: &mut usize,
+    budget: &mut proto::RecvBudget,
+) -> Option<usize> {
     let mut idle = 0;
     let mut fin = false;
     loop {
+        // Absolute per-operation deadline / byte cap. This is what defeats the
+        // slowloris: `tls_tcp_fill` reports progress on every in-order byte, so
+        // the idle counter below never trips while a peer dribbles a record body
+        // that never completes. The deadline does not reset when a byte arrives.
+        if budget.over_budget(cntpct()) {
+            if budget.bytes_exceeded() {
+                println!("[net] receive byte cap exceeded (connection flooding)");
+            } else {
+                println!("[net] receive deadline exceeded (connection too slow)");
+            }
+            return None;
+        }
         if *stream_len >= 5 {
             let ts = unsafe { &mut *nb_tls() };
             let len = ((ts.stream[3] as usize) << 8) | ts.stream[4] as usize;
@@ -962,7 +1037,7 @@ fn tls_read_record(t: &mut Tcp, stream_len: &mut usize) -> Option<usize> {
         if fin {
             return None;
         }
-        let (prog, f) = tls_tcp_fill(t, stream_len);
+        let (prog, f) = tls_tcp_fill(t, stream_len, budget);
         if f {
             fin = true;
         }
@@ -1166,7 +1241,12 @@ fn https_get(
         s.leaf_alg = 3;
     }
 
-    let mut t = tcp_connect(dst_ip, dst_mac, port)?;
+    // One absolute deadline/byte-cap covers the whole TLS operation: the
+    // handshake flight, the application-data read, and the close. It bounds every
+    // record read regardless of how the peer paces or floods bytes. This is
+    // separate from, and layered under, the round-7 HandshakeBudget below.
+    let mut deadline = new_recv_budget();
+    let mut t = tcp_connect(dst_ip, dst_mac, port, &mut deadline)?;
     let mut stream_len = 0usize;
 
     // ClientHello, as a plaintext handshake record.
@@ -1190,7 +1270,7 @@ fn https_get(
     // ServerHello (plaintext handshake record; skip any ChangeCipherSpec).
     let server_pub;
     loop {
-        let total = tls_read_record(&mut t, &mut stream_len)?;
+        let total = tls_read_record(&mut t, &mut stream_len, &mut deadline)?;
         if !budget.charge(total) {
             println!("[tls] handshake exceeded record/byte budget");
             return None;
@@ -1229,7 +1309,7 @@ fn https_get(
     let mut hs_len = 0usize;
     let mut done = false;
     while !done {
-        let total = tls_read_record(&mut t, &mut stream_len)?;
+        let total = tls_read_record(&mut t, &mut stream_len, &mut deadline)?;
         if !budget.charge(total) {
             println!("[tls] handshake exceeded record/byte budget");
             return None;
@@ -1309,7 +1389,7 @@ fn https_get(
     // Read encrypted application records; decrypt into the wiped body region.
     // Post-handshake handshake messages (NewSessionTicket) are ignored.
     let mut total_body = 0usize;
-    while let Some(rlen) = tls_read_record(&mut t, &mut stream_len) {
+    while let Some(rlen) = tls_read_record(&mut t, &mut stream_len, &mut deadline) {
         if !budget.charge(rlen) {
             println!("[tls] exceeded post-handshake record/byte budget");
             break;
@@ -1344,7 +1424,7 @@ fn https_get(
         }
     }
 
-    tcp_close(&mut t);
+    tcp_close(&mut t, &mut deadline);
 
     let resp = unsafe { &(&(*nb()).body)[..total_body] };
     let (status, body_off) = proto::parse_http_response(resp)?;
