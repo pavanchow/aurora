@@ -241,6 +241,17 @@ extern "C" fn rust_fault_handler(sp: usize, kind: u64) -> ! {
     println!("  ELR     = {:#018x}", frame.elr);
     println!("  SPSR    = {:#018x}", frame.spsr);
     println!("  {}", describe_ec(ec));
+
+    // An unrecoverable EL1 fault is a kill-switch trigger: scrub session RAM
+    // before halting so a crash cannot leave the key, vault, or fetched bytes
+    // resident. The scrub runs in a fault context, so it stays simple and
+    // non-allocating and touches only mapped regions (never the guard page).
+    let report = crate::wipe::wipe_and_report();
+    let remaining = crate::amnesia::fault_sentinel_count();
+    println!(
+        "[fault] post-scrub sentinel scan: secret plaintext appears {} times in session RAM ({} bytes scrubbed)",
+        remaining, report.bytes
+    );
     println!("*** halted ***");
     loop {
         unsafe { core::arch::asm!("wfe") }

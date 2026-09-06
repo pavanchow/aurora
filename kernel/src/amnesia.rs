@@ -60,6 +60,26 @@ fn plant(addr: usize) {
     }
 }
 
+/// Plant the raw sentinel at the start, middle and end of the frame pool. Used by
+/// the fault-injection test to seed known secret bytes that the fatal-exception
+/// handler must scrub before halting.
+pub fn plant_fault_sentinel() {
+    let (fs, fe) = mem::frame_pool_range();
+    plant(fs);
+    plant((fs + (fe - fs) / 2) & !0xFFF);
+    plant((fe - 4096) & !0xFFF);
+}
+
+/// Count sentinel occurrences across the managed session RAM (frame pool and
+/// vault). Called from the fatal-exception handler after the scrub to prove no
+/// planted secret survived. Non-allocating and touches only mapped regions, so it
+/// is safe to run from a fault context.
+pub fn fault_sentinel_count() -> u64 {
+    let (fs, fe) = mem::frame_pool_range();
+    let (vs, ve) = mem::vault_region_range();
+    scan(fs, fe, SENTINEL) + scan(vs, ve, SENTINEL)
+}
+
 /// Run the full amnesia proof. Returns true on PASS.
 pub fn prove() -> bool {
     println!("\n[amnesia] === proving trace-free teardown ===");

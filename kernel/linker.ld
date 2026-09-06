@@ -36,6 +36,16 @@ SECTIONS
     . = . + 0x00400000;        /* 4 MiB heap */
     __heap_end = .;
 
+    /* Unmapped guard page directly below the kernel stack. The stack grows down
+       from __stack_top toward __stack_bottom; an overflow keeps going down into
+       this page, which the page tables leave invalid, so the overflow faults at a
+       fixed known boundary and routes into the wipe-then-halt fault path instead
+       of silently scribbling into the heap that sits below it. */
+    . = ALIGN(4096);
+    __guard_start = .;
+    . = . + 0x00001000;        /* 4 KiB stack guard page (left unmapped) */
+    __guard_end = .;
+
     /* Boot / task stacks region. */
     . = ALIGN(4096);
     __stack_bottom = .;

@@ -23,8 +23,20 @@ static mut L2_USER: PageTable = PageTable([0; ENTRIES]);
 #[link_section = ".bss.pagetables"]
 static mut L3_USER: PageTable = PageTable([0; ENTRIES]);
 
+// Refinement table for the 2 MiB region that holds the stack guard page, so that
+// one 4 KiB page can be left unmapped while the surrounding heap and stack pages
+// stay identity-mapped.
+#[link_section = ".bss.pagetables"]
+static mut L3_GUARD: PageTable = PageTable([0; ENTRIES]);
+
 extern "C" {
     static __user_start: u8;
+    static __guard_start: u8;
+}
+
+/// Address of the unmapped stack guard page.
+fn guard_page_addr() -> usize {
+    addr_of!(__guard_start) as usize
 }
 
 /// Address of the EL0 user code page (page 0 of the user region).
@@ -54,6 +66,7 @@ pub fn init() {
         *l1.add(3) = block_1g(0xC000_0000, false);
 
         refine_user_mapping(l1);
+        refine_guard_mapping();
 
         core::arch::asm!(
             "msr mair_el1, {mair}",
@@ -110,6 +123,32 @@ unsafe fn refine_user_mapping(l1: *mut u64) {
     // Link L3 into L2 and L2 into L1.
     *l2.add(l2i) = table_desc(l3 as usize);
     *l1.add(l1i) = table_desc(l2 as usize);
+}
+
+/// Refine the 2 MiB block that holds the stack guard page into a level-3 table of
+/// 4 KiB pages, all identity-mapped EL1-only except the single guard page, which
+/// is left invalid (unmapped). The guard page lives in the same 1 GiB block as the
+/// user region, so it refines the same level-2 table `refine_user_mapping` built;
+/// it must therefore run after it. Done before the MMU is enabled, so no
+/// break-before-make dance is needed.
+unsafe fn refine_guard_mapping() {
+    let guard = guard_page_addr();
+    let l2 = addr_of!(L2_USER) as *mut u64;
+    let l3 = addr_of!(L3_GUARD) as *mut u64;
+
+    // Identity-map the whole 2 MiB region as EL1-only 4 KiB pages so the heap and
+    // stack pages that share this region keep working.
+    let region_base = guard & !(BLOCK_2M - 1);
+    for i in 0..ENTRIES {
+        *l3.add(i) = page_4k(region_base + i * PAGE_SIZE, false, false);
+    }
+
+    // Leave the guard page itself unmapped: an invalid descriptor faults on any
+    // access, which is exactly the stack-overflow boundary we want.
+    *l3.add(ptable::l3_index(guard)) = 0;
+
+    // Link L3 into the block-1 level-2 table at the guard region's slot.
+    *l2.add(ptable::l2_index(guard)) = table_desc(l3 as usize);
 }
 
 /// True once translation is on; read back SCTLR_EL1.M.

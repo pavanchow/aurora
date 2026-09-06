@@ -18,6 +18,8 @@ extern "C" {
     static __vault_end: u8;
     static __stack_bottom: u8;
     static __stack_top: u8;
+    static __guard_start: u8;
+    static __guard_end: u8;
     static __netbuf_start: u8;
     static __netbuf_end: u8;
 }
@@ -114,6 +116,14 @@ pub fn vault_region_range() -> (usize, usize) {
 /// safe to scrub, while `[current_sp, top)` holds the live frames in use.
 pub fn stack_region_range() -> (usize, usize) {
     unsafe { (sym(&__stack_bottom), sym(&__stack_top)) }
+}
+
+/// The unmapped stack guard page byte range `[start, end)`. A stack overflow
+/// growing down past `__stack_bottom` lands here; the page tables leave it invalid
+/// so the access faults at this fixed boundary. Also used by the fault-injection
+/// test path to trigger a deliberate fatal EL1 data abort.
+pub fn guard_page_range() -> (usize, usize) {
+    unsafe { (sym(&__guard_start), sym(&__guard_end)) }
 }
 
 /// Network scratch region byte range `[start, end)`. Holds the virtio-net rings

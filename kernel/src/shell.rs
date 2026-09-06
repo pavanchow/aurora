@@ -69,6 +69,7 @@ pub fn exec(line: &str) -> bool {
             println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
             println!("  panic                trigger a kernel panic (wipes on the way down)");
+            println!("  faulttest            trigger a fatal EL1 fault; proves it wipes before halt");
             println!("  exit                 wipe and shut down the machine");
         }
         "ps" => {
@@ -221,6 +222,21 @@ pub fn exec(line: &str) -> bool {
         }
         "panic" => {
             panic!("wipe kill switch: operator requested panic from shell");
+        }
+        "faulttest" => {
+            // Fault-injection proof: plant a known secret, then deliberately
+            // touch the unmapped stack guard page to raise a fatal EL1 data abort.
+            // The fatal-exception handler must scrub session RAM and report the
+            // planted sentinel gone before it halts. This never returns.
+            println!("[faulttest] planting sentinel, then forcing a fatal EL1 data abort on the guard page");
+            crate::amnesia::plant_fault_sentinel();
+            println!(
+                "[faulttest] sentinel present {} time(s) pre-fault",
+                crate::amnesia::fault_sentinel_count()
+            );
+            let (guard, _) = mem::guard_page_range();
+            unsafe { core::ptr::write_volatile(guard as *mut u64, 0xDEAD_BEEF) };
+            println!("[faulttest] unreachable: guard page did not fault");
         }
         "exit" => {
             return false;
