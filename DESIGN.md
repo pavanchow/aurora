@@ -461,28 +461,53 @@ The pieces, all from scratch with zero external crates.
   (ChangeCipherSpec, Finished, and the HTTP request) is sent as a single TCP
   segment so a polled client with no data retransmit has the smallest possible
   surface for a dropped segment.
-- Certificate handling parses the X.509 chain as ASN.1 DER in
-  `kernel/src/x509.rs`, pulls the leaf public key, subject CN, subject
-  alternative names, and validity dates, and verifies the server
-  CertificateVerify signature against the leaf public key with a from-scratch
-  Ed25519 verifier in `kernel/src/ed25519.rs` (RFC 8032), which reuses the
-  from-scratch SHA-512. The SNI host is matched against the certificate dNSName or
-  iPAddress SANs, or the subject CN.
+- Certificate handling parses each X.509 certificate as ASN.1 DER in
+  `kernel/src/x509.rs`, pulling the public key, subject CN, subject alternative
+  names, validity dates, issuer and subject DER Names, and the basicConstraints CA
+  flag. The presented chain (leaf first, then intermediates) is verified in
+  `kernel/src/certchain.rs`: walking from the leaf up, each certificate's signature
+  is verified under its issuer's public key, matching issuers by exact DER
+  Subject/Issuer Name equality and requiring each issuer to assert `cA = TRUE`,
+  until a certificate is reached whose issuer is an embedded trust anchor
+  (`kernel/src/trust_store.rs`) and whose signature verifies under that anchor's
+  key. The server CertificateVerify is then verified against the leaf public key,
+  and the requested host is matched against the leaf dNSName or iPAddress SANs, or
+  the subject CN.
+- The signature verifiers are all from scratch: Ed25519 (RFC 8032) in
+  `kernel/src/ed25519.rs`, ECDSA P-256 (secp256r1) in `kernel/src/ecdsa_p256.rs`
+  on the from-scratch big integer `kernel/src/bigint.rs`, and RSA (PKCS#1 v1.5 and
+  PSS with MGF1-SHA256) in `kernel/src/rsa.rs` on the same big integer. Chain-link
+  signatures use ECDSA-P256-SHA256, Ed25519, or RSA-PKCS#1-v1.5-SHA256; the TLS 1.3
+  CertificateVerify uses Ed25519, ECDSA-P256-SHA256, or RSA-PSS (rsa_pss_rsae_sha256).
+  Each verifier is checked on the host against known-answer vectors (RFC 6979 for
+  ECDSA, RFC 8032 for Ed25519, OpenSSL-generated PKCS#1/PSS vectors for RSA), and
+  `certchain` is checked against fixed ECDSA and RSA chains for both accept and
+  reject.
 
-The exact validation level, stated plainly. When the server CertificateVerify is
-Ed25519 and its signature verifies against the leaf key and the SNI host matches
-the certificate, Aurora reports authenticated-to-leaf: the handshake transcript is
-cryptographically bound to that leaf public key and the name matches. It does not
-anchor the leaf to an embedded root-CA trust store, so a self-signed or otherwise
-unrooted leaf still reaches only authenticated-to-leaf, not
-authenticated-to-a-trusted-CA. When the leaf signature scheme is one Aurora does
-not yet verify (ECDSA or RSA), it establishes the encrypted channel and reports
-that the leaf binding was not verified rather than pretending otherwise. There is
-no revocation check and no wall-clock date enforcement, because Aurora has no
-real-time clock, so validity dates are parsed and shown but not compared against
-the current time. A `-k` insecure/pinned mode is available for the deterministic
-local self-test, where the point is to prove the record layer, handshake, and
-HTTP-over-TLS end to end against a self-signed server.
+The exact validation level, stated plainly. A plain `https://` fetch reaches
+`authenticated` only when all three hold: the presented chain verified to an
+embedded trusted root, the CertificateVerify signature verified against the leaf
+key (binding the handshake transcript to that key), and the requested host name
+matched the leaf. Any failure is a hard rejection with a clear reason, printed and
+propagated so `fetch` fails: an untrusted root (`no path to an embedded trusted
+root`), a broken or forged chain signature (`a chain signature did not verify`), or
+a host-name mismatch (`host name does not match certificate`). There is no "fall
+back to trusting the leaf". The embedded trust store holds exactly one anchor, the
+deterministic Aurora test root CA (a P-256 key), so the locally served ECDSA chain
+authenticates against a real root the kernel embedded. No public web-PKI roots are
+embedded, so a plain fetch of a public site rejects (its root is not a trust
+anchor) rather than overclaiming; embedding real roots is left out deliberately
+because shipping anchors Aurora cannot fully validate would be dishonest. The RSA
+chain-link and RSA-PSS CertificateVerify paths are implemented, wired into the live
+handshake, and verified by host known-answer and chain tests; the in-QEMU
+deterministic gate exercises the ECDSA chain end to end. Two limitations are
+inherent and documented rather than hidden: there is no revocation check (no OCSP
+or CRL), and there is no wall-clock date enforcement, because Aurora has no
+real-time clock, so `notBefore`/`notAfter` are parsed and shown but never compared
+against the current time (an expired but otherwise valid chain is not rejected on
+that basis). A `-k` insecure/pinned mode relaxes the chain, name, and leaf-binding
+checks for the deterministic local self-test against a self-signed server, where
+the point is to prove the record layer, handshake, and HTTP-over-TLS end to end.
 
 The handshake carries a total work budget so a peer cannot pin the single core.
 A record read only bounds an idle connection, one where no bytes are arriving, so
@@ -692,14 +717,19 @@ then asserts the markers that can only appear if each subsystem worked:
   GET against a local host server the script starts on the fly, returning a known
   unique payload the test asserts byte for byte, which makes the TCP and HTTP path
   deterministic without depending on external internet,
-- the TLS 1.3 path, a real handshake from inside Aurora against a local TLS 1.3
-  server (OpenSSL `s_server` with a self-signed Ed25519 leaf, ChaCha20 only) that
-  the script starts on the fly: the test asserts the negotiated
-  TLS_CHACHA20_POLY1305_SHA256 suite and x25519 group, that the server ed25519
-  CertificateVerify verified against the leaf key, that Aurora reached
-  authenticated-to-leaf, and that the exact known payload came back over the
-  encrypted channel, making the TLS record layer, key schedule, and HTTP-over-TLS
-  deterministic without external internet,
+- the TLS 1.3 authenticated path, a real handshake from inside Aurora against a
+  local TLS 1.3 server (OpenSSL `s_server`, ChaCha20 only) serving a deterministic
+  ECDSA P-256 chain (root -> intermediate -> leaf) whose root public key is
+  embedded in the kernel trust store: the test asserts the negotiated
+  TLS_CHACHA20_POLY1305_SHA256 suite and x25519 group, that the ECDSA
+  CertificateVerify verified against the leaf, that the chain anchored to the
+  embedded root so Aurora reached validation level `authenticated`, and that the
+  exact known payload came back over the encrypted channel. Three sibling servers
+  present the rejection cases (an untrusted root, a tampered chain signature, and a
+  wrong-name leaf); the test asserts each fetch fails cleanly with its reason while
+  the shell keeps answering, and that a `-k` fetch of a self-signed Ed25519 server
+  still completes. This makes the chain verification, TLS record layer, key
+  schedule, and HTTP-over-TLS deterministic without external internet,
 - a best-effort live HTTPS fetch of `https://example.com/` over the real internet,
   which is printed and not a hard failure when offline,
 - the amnesia of fetched bytes, a fingerprint of the real fetched body taken over
@@ -746,15 +776,20 @@ Remaining edges, stated plainly. EL0 tasks share one address space, one TTBR0, s
 the boundary is kernel versus user rather than per-task. Kindling values live on the
 kernel heap during a run, which the wipe covers but which is not zeroed the instant
 a value is dropped. The network stack is polled and drives one TCP connection at a
-time over HTTP/1.0, with no TLS or HTTPS, no congestion control, and only minimal
-retransmit, enough to fetch bytes over a real handshake, not a general socket
-layer. The wipe does
+time over HTTP/1.0 (or TLS 1.3 for `https://`), with no congestion control, and
+only minimal retransmit, enough to fetch bytes over a real handshake, not a general
+socket layer. The wipe does
 not scrub the live kernel stack frames it is running on, the code, or the in-use
 heap. The kernel still runs on a single core with secondary cores parked. The TLS
-1.3 client reaches authenticated-to-leaf but does not anchor to a root CA, does
-not check revocation, does not enforce wall-clock validity dates (there is no
-real-time clock), has no TLS 1.2 fallback, verifies only Ed25519 CertificateVerify
-signatures today, and handles one connection at a time.
+1.3 client authenticates a server by verifying its certificate chain to an embedded
+trusted root, the CertificateVerify against the leaf, and the host name, with
+Ed25519, ECDSA-P256, and RSA (PKCS#1 v1.5 for chain links, PSS for CertificateVerify)
+signature verification. Its limits: the embedded trust store holds only the Aurora
+test root (no public web-PKI roots, so public sites reject unless `-k`), it does not
+check revocation (no OCSP or CRL), it does not enforce wall-clock validity dates
+(there is no real-time clock, so dates are parsed and shown but not compared), it
+negotiates only TLS_CHACHA20_POLY1305_SHA256 with x25519 and has no TLS 1.2
+fallback, and it handles one connection at a time.
 
 ## The concepts layer
 

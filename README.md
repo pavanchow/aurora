@@ -100,11 +100,16 @@ throwaway compute.
   TLS_CHACHA20_POLY1305_SHA256, so it reuses the in-tree ChaCha20-Poly1305 AEAD,
   with x25519 key exchange, an HKDF-over-HMAC-SHA256 key schedule, and SHA-256 for
   the transcript, all written from scratch. It parses the server certificate chain
-  (ASN.1 DER) and verifies the server CertificateVerify signature against the leaf
-  public key with a from-scratch Ed25519 verifier, then checks the SNI host
-  against the certificate name, reaching an authenticated-to-leaf channel. Full
-  root-CA chain anchoring, revocation, and wall-clock date enforcement are not yet
-  done and are stated as such. The x25519 private key, every TLS traffic key, and
+  (ASN.1 DER) and authenticates the server: it verifies the chain from the leaf up
+  to an embedded trusted root, verifies the CertificateVerify against the leaf
+  public key, and matches the host name, reaching validation level `authenticated`.
+  Any failure (untrusted root, broken chain signature, or name mismatch) rejects
+  the handshake with a clear reason. Signature verification is from scratch for
+  Ed25519, ECDSA P-256, and RSA (PKCS#1 v1.5 for chain links, PSS for
+  CertificateVerify). The embedded trust store holds the Aurora test root only, so
+  public web sites reject (their roots are not embedded) unless `-k` is used;
+  revocation and wall-clock date enforcement are not done (no real-time clock) and
+  are stated as such. The x25519 private key, every TLS traffic key, and
   the decrypted response plaintext all live in the wiped network region, so a wipe
   scrubs them. The handshake carries a total work budget (512 records and 512 KiB
   across the whole exchange), so a peer that floods records which never advance the
@@ -265,11 +270,16 @@ the amnesia proof that the sentinel is gone after the wipe:
 ./scripts/boot-test.sh
 ```
 
-The boot test also stands up a local TLS 1.3 server (OpenSSL `s_server` with a
-self-signed Ed25519 leaf, ChaCha20 only) and asserts that Aurora completes a real
-TLS 1.3 handshake against it, verifies the ed25519 CertificateVerify against the
-leaf key, reaches authenticated-to-leaf, and returns the exact known payload over
-the encrypted channel. A best-effort `fetch https://example.com/` over the real
+The boot test also stands up a local TLS 1.3 server (OpenSSL `s_server`, ChaCha20
+only) serving a deterministic ECDSA P-256 chain (root -> intermediate -> leaf)
+whose root is embedded in the kernel trust store, and asserts that Aurora completes
+a real TLS 1.3 handshake, verifies the chain to that root, verifies the ECDSA
+CertificateVerify against the leaf, matches the host, reaches validation level
+`authenticated`, and returns the exact known payload over the encrypted channel.
+Three sibling servers present an untrusted root, a tampered chain signature, and a
+wrong-name leaf, and the test asserts each fetch is rejected cleanly with its
+reason while the shell keeps answering; a `-k` fetch of a self-signed Ed25519
+server still completes. A best-effort `fetch https://example.com/` over the real
 internet is printed but never hard-fails when offline. A separate short run points
 Aurora at a hostile server that floods ChangeCipherSpec records without end and
 asserts that the handshake aborts on its record/byte budget within about a second,
@@ -327,18 +337,22 @@ is polled and drives one TCP connection at a time, with no congestion control an
 minimal retransmit, enough to fetch bytes over a real handshake rather than a
 general socket layer.
 
-The TLS 1.3 client is real but deliberately scoped. It establishes an
-authenticated-to-leaf TLS 1.3 channel: it verifies the server CertificateVerify
-signature against the leaf certificate's public key (Ed25519 today) and matches
-the SNI host against the certificate name, so the transcript is cryptographically
-bound to that leaf key. What it does not yet do, and does not pretend to do, is
-anchor the leaf to an embedded root-CA trust store, so a server presenting a
-self-signed or otherwise unrooted leaf still completes as authenticated-to-leaf
-rather than authenticated-to-a-trusted-CA. For leaves signed with ECDSA or RSA
-(rather than Ed25519) it establishes the encrypted channel but reports that the
-leaf signature scheme was not verified. There is no certificate revocation check,
-no wall-clock date enforcement (Aurora has no real-time clock, so validity dates
-are parsed and displayed but not compared to "now"), no TLS 1.2 fallback, one
-cipher suite (TLS_CHACHA20_POLY1305_SHA256) and one group (x25519), and one
-connection at a time. A `-k` insecure/pinned mode exists for the deterministic
-local self-test. DESIGN.md states these in full.
+The TLS 1.3 client is real but deliberately scoped. It authenticates a server: it
+verifies the presented certificate chain from the leaf up to an embedded trusted
+root (matching issuers by exact DER Name and requiring CA constraints), verifies
+the CertificateVerify against the leaf public key, and matches the host name, so a
+plain `https://` fetch reaches validation level `authenticated` only when all three
+hold. Any failure (untrusted root, broken chain signature, name mismatch) is a hard
+rejection with a clear reason. Signature verification is from scratch for Ed25519,
+ECDSA P-256, and RSA (PKCS#1 v1.5 for chain links, PSS for CertificateVerify), each
+checked against known-answer vectors on the host. What it deliberately does not do:
+the embedded trust store holds only the Aurora test root, so a public web site
+whose real root is not embedded is rejected (not silently downgraded) unless `-k`
+is used; there is no certificate revocation check (no OCSP or CRL); there is no
+wall-clock date enforcement (Aurora has no real-time clock, so validity dates are
+parsed and displayed but not compared to "now", and an expired chain is not
+rejected on that basis); there is no TLS 1.2 fallback; and it offers one cipher
+suite (TLS_CHACHA20_POLY1305_SHA256), one group (x25519), and one connection at a
+time. A `-k` insecure/pinned mode relaxes the chain, name, and leaf-binding checks
+for the deterministic local self-test against a self-signed server. DESIGN.md
+states these in full.
