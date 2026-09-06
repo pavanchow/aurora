@@ -378,16 +378,32 @@ pub fn run() -> ! {
             // Multi-line program entry: accumulate until a lone '.' line.
             println!("[compute] enter program, end with a single '.' on its own line");
             let mut program = String::new();
+            let mut overflow = false;
             loop {
                 print!("... ");
                 let l = read_line(&history);
                 if l.trim() == "." {
                     break;
                 }
-                program.push_str(&l);
-                program.push('\n');
+                // Stop appending once the program would exceed the total-size cap,
+                // but keep draining lines until the '.' so the input never piles up
+                // unbounded in RAM. The oversized program is then reported cleanly.
+                if !overflow && program.len() + l.len() + 1 > session::MAX_COMPUTE_BYTES {
+                    overflow = true;
+                }
+                if !overflow {
+                    program.push_str(&l);
+                    program.push('\n');
+                }
             }
-            syscall::sys_compute(&program);
+            if overflow {
+                println!(
+                    "[compute] error: program too large (over {} bytes)",
+                    session::MAX_COMPUTE_BYTES
+                );
+            } else {
+                syscall::sys_compute(&program);
+            }
             continue;
         }
 

@@ -16,6 +16,14 @@ use crate::{entropy, kindling, mem, print, println};
 /// cannot hang the single-core kernel, it traps with a step-limit error instead.
 const COMPUTE_STEP_LIMIT: u64 = 50_000_000;
 
+/// Hard cap on the total source size of one compute run, across every line of a
+/// multi-line program. A large program is rejected cleanly before it is even
+/// tokenized, so it cannot OOM the kernel heap: the lexer expands each source byte
+/// into a ~40-byte token, so the token vector for the input plus its growth
+/// headroom must fit well inside the 4 MiB kernel heap. The shell caps its
+/// multi-line accumulation at the same ceiling so the input never piles up in RAM.
+pub const MAX_COMPUTE_BYTES: usize = 16 * 1024;
+
 // Capabilities an agent session can hold. CAP_NET is never granted: Aurora has
 // no network path, and the point is trace-free local work.
 pub const CAP_VAULT: u32 = 1 << 0;
@@ -342,6 +350,13 @@ pub fn run_task(name: &str) -> bool {
 pub fn compute(src: &str) -> bool {
     if !has_cap(CAP_COMPUTE) {
         println!("[compute] denied: session inactive or missing CAP_COMPUTE");
+        return false;
+    }
+    if src.len() > MAX_COMPUTE_BYTES {
+        println!(
+            "[compute] error: program too large (over {} bytes)",
+            MAX_COMPUTE_BYTES
+        );
         return false;
     }
     // Convenience: a bare expression like `compute 40 + 2` is not a valid
