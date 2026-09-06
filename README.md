@@ -105,9 +105,17 @@ throwaway compute.
   scrubs them. The handshake carries a total work budget (512 records and 512 KiB
   across the whole exchange), so a peer that floods records which never advance the
   handshake, such as a ChangeCipherSpec flood, aborts with a clean `tls handshake
-  exceeded record/byte budget` error instead of pinning the single core. Limits:
-  one connection at a time, HTTP/1.0 over TLS, polled with no congestion control,
-  and no TLS 1.2 fallback.
+  exceeded record/byte budget` error instead of pinning the single core. Every
+  fetch is additionally bounded by a TOTAL per-fetch receive deadline and a total
+  wire-byte cap (15 seconds and 4 MiB, checked at the single lowest-level receive
+  point, so they cover the TLS handshake, TLS application-data, and plain HTTP
+  alike). The deadline is ABSOLUTE for the operation: a byte arriving does not
+  reset it, so a slowloris peer that dribbles a never-completing record one byte at
+  a time, which slips past both the record budget and the per-record idle counter,
+  aborts within seconds with a `receive deadline exceeded` error instead of hanging
+  the core. Limits: one connection at a time, HTTP/1.0 over TLS, polled with no
+  congestion control, and no TLS 1.2 fallback. The single-shot DNS, ARP, and ICMP
+  paths are bounded by their own small poll caps rather than this deadline.
 - Tears down without a trace. On session or task exit that session's memory and
   vault are scrubbed, no shell history is retained, and caches are flushed. A full
   session runs and then leaves RAM clean.

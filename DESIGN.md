@@ -489,6 +489,38 @@ against a local server that floods ChangeCipherSpec records without end: the fet
 returns the budget error in about a second, the shell answers a normal command,
 and QEMU exits cleanly, where the old code would have been killed by the watchdog.
 
+The record/byte budget above is charged once per COMPLETED record, so it has a
+blind spot: a peer that sends a record header claiming a length just under the
+17408-byte record cap, then dribbles that body one byte every 50ms and never
+completes the record, never completes a record to charge. The per-record read
+loop only bounds an idle connection, and its idle counter resets on every byte
+that arrives, so a steady dribble keeps it pinned at zero and pins the single
+core for as long as the peer keeps trickling. The same missing bound left a
+latent spin in the plain HTTP path, where an out-of-order segment flood (the TCP
+parser does no sequence validation) would loop without ever advancing the body.
+
+The universal fix is a TOTAL per-fetch receive budget that meters time and wire
+bytes rather than completed records, in `proto::RecvBudget`. At the start of a
+fetch Aurora reads the ARM generic timer and sets an ABSOLUTE wall-clock deadline
+(15 seconds) for the whole operation. The deadline is the key change: a byte
+arriving does NOT reset it, unlike an idle timer, so a dribble that never
+completes anything still trips it. A second bound caps the total wire bytes
+received in one fetch (4 MiB), charging every byte pulled off the wire, including
+bytes accumulating inside an as-yet-incomplete record, so even a fast flood that
+completes nothing is bounded. Both bounds are checked at the single lowest-level
+receive point every path funnels through (`tcp_poll`), so they cover the TLS
+handshake, TLS application-data, and the plain HTTP receive alike; the plain HTTP
+loop also drops out-of-order segments so it cannot spin. When either bound trips
+the fetch aborts with a clean `receive deadline exceeded (connection too slow)`
+or `receive byte cap exceeded` error that propagates up, so `fetch` and `tlsinfo`
+fail promptly and the shell keeps running. A real fetch completes in well under a
+second and a few tens of kilobytes, far under both bounds, so it never sees them.
+The round-7 handshake record/byte budget is kept as defense in depth. The boot
+test proves the fix with a separate QEMU run against a local server that dribbles
+a TLS record body one byte per 50ms forever: the fetch returns the deadline error
+within the budget instead of the old 75s+ hang, the shell answers `compute 7 + 7`
+afterward, and QEMU exits cleanly.
+
 Amnesia extends to TLS. The x25519 private key, all of the traffic secrets and
 keys, the transcript state, and the decrypted response plaintext live in the
 reserved network region (`TlsScratch` inside the netbuf region), so a wipe scrubs
