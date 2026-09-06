@@ -318,6 +318,78 @@ pub fn parse_tcp(seg: &[u8]) -> Option<TcpSeg> {
     })
 }
 
+// --- Total per-operation receive budget --------------------------------------
+
+/// A total, absolute receive budget for one whole fetch operation, metering both
+/// wall-clock time and total wire bytes.
+///
+/// This is the universal fix for a receive-path slowloris. The per-record idle
+/// counters elsewhere reset whenever a byte arrives, so a peer that dribbles one
+/// byte at a time (never completing a record) keeps every idle counter pinned to
+/// zero and pins the single core forever. This budget is different: the deadline
+/// is ABSOLUTE for the operation. A byte arriving does NOT reset it. The byte cap
+/// likewise counts every byte pulled off the wire, including bytes accumulating
+/// inside a record that never completes, so even a fast flood that completes
+/// nothing is bounded.
+///
+/// The wall-clock is supplied by the caller as a monotonic tick (the ARM generic
+/// timer in the kernel, a synthetic value in host tests), keeping this type pure
+/// and host-testable.
+#[derive(Clone)]
+pub struct RecvBudget {
+    start: u64,
+    deadline_ticks: u64,
+    bytes: usize,
+    max_bytes: usize,
+    over_bytes: bool,
+}
+
+impl RecvBudget {
+    /// Start a budget at tick `now`, expiring after `deadline_ticks` more ticks
+    /// or after `max_bytes` total wire bytes, whichever comes first.
+    pub fn new(now: u64, deadline_ticks: u64, max_bytes: usize) -> Self {
+        Self {
+            start: now,
+            deadline_ticks,
+            bytes: 0,
+            max_bytes,
+            over_bytes: false,
+        }
+    }
+
+    /// True once the elapsed ticks since `start` exceed the deadline. Monotonic
+    /// tick source, so `wrapping_sub` is only defensive against a counter wrap.
+    pub fn time_exceeded(&self, now: u64) -> bool {
+        now.wrapping_sub(self.start) > self.deadline_ticks
+    }
+
+    /// Charge `n` wire bytes. Returns `true` while within the byte cap and
+    /// `false` the moment it is crossed; the over-budget state is sticky.
+    pub fn charge(&mut self, n: usize) -> bool {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > self.max_bytes {
+            self.over_bytes = true;
+        }
+        !self.over_bytes
+    }
+
+    /// True once the byte cap has been crossed.
+    pub fn bytes_exceeded(&self) -> bool {
+        self.over_bytes
+    }
+
+    /// The single check a receive loop makes each iteration: either the absolute
+    /// deadline passed or the byte cap was crossed.
+    pub fn over_budget(&self, now: u64) -> bool {
+        self.over_bytes || self.time_exceeded(now)
+    }
+
+    #[allow(dead_code)] // used by host tests and available for diagnostics
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 // --- HTTP/1.0 ----------------------------------------------------------------
 
 /// Parse an HTTP response: the status code from the status line and the offset
@@ -359,4 +431,58 @@ fn find_body(resp: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_budget_time_deadline_is_absolute() {
+        // 1000-tick deadline, a huge byte cap so only time can trip it.
+        let b = RecvBudget::new(100, 1000, usize::MAX);
+        assert!(!b.over_budget(100)); // start
+        assert!(!b.over_budget(1100)); // exactly at the deadline, still ok
+        assert!(b.over_budget(1101)); // one tick past: expired
+        assert!(b.time_exceeded(5000));
+    }
+
+    #[test]
+    fn recv_budget_a_byte_does_not_reset_the_deadline() {
+        // The slowloris property: charging bytes must never push the deadline
+        // out. The deadline is measured only from `start`, regardless of traffic.
+        let mut b = RecvBudget::new(0, 1000, usize::MAX);
+        for now in [200u64, 400, 600, 800, 1000] {
+            assert!(b.charge(1)); // a byte trickles in, well under the cap
+            assert!(!b.over_budget(now));
+        }
+        // Time still runs out at the same absolute point despite the traffic.
+        assert!(b.over_budget(1001));
+    }
+
+    #[test]
+    fn recv_budget_byte_cap_trips_and_is_sticky() {
+        // Small byte cap, effectively infinite time: only bytes can trip it.
+        let mut b = RecvBudget::new(0, u64::MAX, 100);
+        assert!(b.charge(60));
+        assert!(!b.bytes_exceeded());
+        assert!(!b.charge(50)); // 110 > 100: crosses the cap
+        assert!(b.bytes_exceeded());
+        assert!(b.over_budget(0)); // over even though time has not moved
+        // The state is sticky and saturates rather than wrapping.
+        assert!(!b.charge(usize::MAX));
+        assert!(b.bytes_exceeded());
+    }
+
+    #[test]
+    fn recv_budget_legit_fetch_stays_within_budget() {
+        // A real fetch: a few hundred KB within a second, far under a multi-MB
+        // cap and a multi-second deadline, never trips.
+        let mut b = RecvBudget::new(0, 1_000_000_000, 4 * 1024 * 1024);
+        for _ in 0..256 {
+            assert!(b.charge(1400)); // ~358 KB total
+        }
+        assert!(!b.over_budget(500_000_000)); // half the deadline elapsed
+        assert_eq!(b.bytes(), 256 * 1400);
+    }
 }
