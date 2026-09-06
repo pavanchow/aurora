@@ -345,10 +345,25 @@ recovery point. Synchronous exceptions taken from EL0 route to a dedicated handl
 An SVC is dispatched as a syscall and returns to EL0 normally, so legitimate
 syscalls work. Any other fault, such as a data abort from touching kernel memory,
 is reported and recovered from by longjmping back into the kernel, so a misbehaving
-user task cannot take the machine down. The boot test drops to EL0, makes a
-legitimate write syscall, then reads the vault directly. The read faults with a
-data abort whose fault address is exactly the vault region, the kernel prints the
-denial, and the machine keeps running.
+user task cannot take the machine down.
+
+EL0 syscall pointers are validated. A syscall that forms a slice from an
+EL0-supplied pointer and length (write, the message send and receive pair, run
+and compute) now checks the whole range lies inside the calling task's user region
+and that the length is under a sane bound, before it dereferences anything. The
+check is a small uaccess helper whose pure range test lives in
+`kernel/src/uaccess.rs`, mounted into the aurora-logic crate and unit-tested on
+the host, and it uses a checked add so a pointer plus length that would wrap the
+address space is rejected too. On failure the kernel returns an EFAULT-style error
+to EL0 without ever touching the pointer, and continues. The distinction is drawn
+by entry path: an SVC taken from EL0 is validated, an SVC from an in-kernel EL1
+caller passes a trusted pointer and is not. So a user task cannot hand the kernel a
+pointer into the vault or the session key and have the kernel read or write it on
+the task's behalf. The boot test drops to EL0 and makes an out-of-region write, an
+absurd-length write, and an out-of-region message send, all of which are rejected
+cleanly as EFAULT, then a legitimate in-region write the kernel services, then a
+direct vault read. The read faults with a data abort whose fault address is exactly
+the vault region, the kernel prints the denial, and the machine keeps running.
 
 All EL0 tasks currently share one address space, one TTBR0, so the boundary is
 kernel versus user rather than per-task. That is stated plainly rather than
@@ -520,6 +535,20 @@ test proves the fix with a separate QEMU run against a local server that dribble
 a TLS record body one byte per 50ms forever: the fetch returns the deadline error
 within the budget instead of the old 75s+ hang, the shell answers `compute 7 + 7`
 afterward, and QEMU exits cleanly.
+
+The same absolute-deadline discipline now covers the control-plane resolvers too.
+`resolve` over UDP, `arp_resolve`, and `icmp_echo` used to poll `recv_frame`
+directly under only small fixed poll caps, outside any wall-clock bound. Each now
+starts a `RecvBudget` on the same generic timer, with a few-second deadline, and
+checks it every poll iteration, keeping the small poll caps as the inner bound. A
+nameserver or layer-2 peer that never answers, answers slowly, or floods
+non-matching frames therefore cannot run the loop past the deadline. `resolve`
+retransmits only while the deadline holds and, when it expires, returns a clean
+`dns: no response within deadline` error with the shell surviving. A real lookup
+answers well within the budget. A separate QEMU run proves it against an inlined
+local UDP server that accepts the query and never replies: `resolve` aborts in a
+few seconds with the deadline error, the shell answers a normal command, and QEMU
+exits cleanly, where an unbounded resolver would be killed by the watchdog.
 
 Amnesia extends to TLS. The x25519 private key, all of the traffic secrets and
 keys, the transcript state, and the decrypted response plaintext live in the
@@ -696,9 +725,12 @@ proof that the sentinel is gone after the wipe.
 Now enforced by hardware. The session key comes from the ARMv8.5 RNDR hardware
 RNG when the CPU has one, with the timer fallback only when it does not. Agent
 code can run at EL0 where the vault, the key, and kernel RAM are unreachable and a
-direct access faults to the kernel. The wipe now also scrubs the free kernel stack
-below the current stack pointer, and vault operations zero their plaintext staging
-buffers immediately.
+direct access faults to the kernel. Every syscall that forms a slice from an
+EL0-supplied pointer and length validates the whole range against the calling
+task's user region, with a checked add and a length bound, before dereferencing,
+so a user task cannot make the kernel read or write kernel RAM on its behalf. The
+wipe now also scrubs the free kernel stack below the current stack pointer, and
+vault operations zero their plaintext staging buffers immediately.
 
 Not solved, and hardware-dependent. True cold-boot and DMA resistance is out of
 scope, a physical attacker with bus access or a cold RAM chip can read memory
@@ -707,9 +739,7 @@ encryption, the CPU sees plaintext in registers and caches during use. There is
 no secure boot or firmware trust.
 
 Remaining edges, stated plainly. EL0 tasks share one address space, one TTBR0, so
-the boundary is kernel versus user rather than per-task. The EL0 probe's write
-syscall trusts the pointer it is handed, acceptable for the in-tree probe but not
-for untrusted user pointers without bounds checking. Kindling values live on the
+the boundary is kernel versus user rather than per-task. Kindling values live on the
 kernel heap during a run, which the wipe covers but which is not zeroed the instant
 a value is dropped. The network stack is polled and drives one TCP connection at a
 time over HTTP/1.0, with no TLS or HTTPS, no congestion control, and only minimal

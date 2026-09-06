@@ -81,7 +81,11 @@ throwaway compute.
   translation permissions, so a user task cannot read or write the vault, the
   session key, or any other kernel RAM directly. An attempt faults to the kernel,
   which reports it and keeps running, while legitimate syscalls from EL0 still
-  work.
+  work. Every syscall that forms a slice from an EL0-supplied pointer and length
+  now validates the whole range against the calling task's user region, with a
+  checked add and a length bound, before dereferencing, so a user task cannot hand
+  the kernel a pointer into kernel RAM and have it read or written on its behalf.
+  In-kernel EL1 callers pass trusted pointers and are not checked.
 - Offers a revocable network channel. A from-scratch virtio-net driver and a
   minimal Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, and HTTP/1.0 stack give an
   agent a real path to pull bytes off the internet, gated by CAP_NET. The `fetch`
@@ -115,7 +119,11 @@ throwaway compute.
   aborts within seconds with a `receive deadline exceeded` error instead of hanging
   the core. Limits: one connection at a time, HTTP/1.0 over TLS, polled with no
   congestion control, and no TLS 1.2 fallback. The single-shot DNS, ARP, and ICMP
-  paths are bounded by their own small poll caps rather than this deadline.
+  receive loops share the same discipline: each runs under its own absolute
+  few-second deadline on the same generic timer, checked every poll, with the small
+  poll caps kept as the inner bound, so a nameserver or layer-2 peer that never
+  answers, answers slowly, or floods frames returns a clean error promptly (for DNS
+  a `dns: no response within deadline`) rather than spinning the core.
 - Tears down without a trace. On session or task exit that session's memory and
   vault are scrubbed, no shell history is retained, and caches are flushed. A full
   session runs and then leaves RAM clean.
@@ -216,7 +224,7 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `net <msg>`         | ICMP echo round-trip over the network (needs CAP_NET) |
 | `fetch [-k] <url>`  | GET `http://` or TLS 1.3 `https://` `host[:port]/path`, print the body (needs CAP_NET); `-k` is the insecure/pinned self-test mode |
 | `tlsinfo [-k] <host>` | TLS 1.3 handshake, print negotiated group, cipher suite, cert subject, and validation level (needs CAP_NET) |
-| `resolve <name> [ns]` | live DNS A-record lookup (needs CAP_NET)          |
+| `resolve <name> [ns [port]]` | live DNS A-record lookup (needs CAP_NET)   |
 | `netamnesia [-k] <url>` | fetch any real URL (http or https), fingerprint the real fetched bytes, wipe, prove that fingerprint (incl. decrypted TLS plaintext) is gone |
 | `el0test`           | run an EL0 user task that must fault on kernel RAM   |
 | `wipe`              | scrub the key, vault, frames, network buffers, and free stack to zero |
@@ -304,17 +312,15 @@ DESIGN.md   how the kernel boots, how it encrypts and wipes, and how the boot te
 Aurora enforces RAM-only operation, in-RAM authenticated encryption of vault
 secrets, a measured scrub of the key, the session RAM, and the free kernel stack,
 a hardware RNG session key when the CPU has one, an EL0 hardware boundary that
-faults on kernel or vault access, and a boot-test proof that the sentinel is gone
-after a wipe. It does not defend against a physical attacker with bus or cold-RAM
-access, it does not encrypt RAM at rest on the memory bus, and it does not do
-secure boot.
+faults on kernel or vault access and validates every EL0-supplied syscall pointer
+and length before use, and a boot-test proof that the sentinel is gone after a
+wipe. It does not defend against a physical attacker with bus or cold-RAM access,
+it does not encrypt RAM at rest on the memory bus, and it does not do secure boot.
 
 Remaining edges worth naming plainly. EL0 tasks all share one address space, one
-TTBR0, so the boundary today is kernel versus user rather than per-task. The EL0
-probe's write syscall trusts the pointer it is handed, which is fine for the
-in-tree probe but would need bounds checking before running untrusted user
-pointers. Kindling values live on the kernel heap during a run, which the wipe
-covers but which is not zeroed the instant a value is dropped. The network stack
+TTBR0, so the boundary today is kernel versus user rather than per-task. Kindling
+values live on the kernel heap during a run, which the wipe covers but which is not
+zeroed the instant a value is dropped. The network stack
 is polled and drives one TCP connection at a time, with no congestion control and
 minimal retransmit, enough to fetch bytes over a real handshake rather than a
 general socket layer.
