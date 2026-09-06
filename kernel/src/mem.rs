@@ -22,6 +22,8 @@ extern "C" {
     static __guard_end: u8;
     static __netbuf_start: u8;
     static __netbuf_end: u8;
+    static __estack_bottom: u8;
+    static __estack_top: u8;
 }
 
 fn sym(p: *const u8) -> usize {
@@ -131,6 +133,19 @@ pub fn guard_page_range() -> (usize, usize) {
 /// them and the amnesia scan can sweep the whole region.
 pub fn netbuf_region_range() -> (usize, usize) {
     unsafe { (sym(&__netbuf_start), sym(&__netbuf_end)) }
+}
+
+/// Kernel heap byte range `[start, end)`. Used by the fault path to report
+/// whether a trap frame landed in the heap (it must not).
+pub fn heap_region_range() -> (usize, usize) {
+    unsafe { (sym(&__heap_start), sym(&__heap_end)) }
+}
+
+/// Dedicated exception-stack byte range `[bottom, top)`. EL1 fault entry switches
+/// SP to `top` so the trap frame is saved here, never in the heap below the stack
+/// guard page.
+pub fn estack_region_range() -> (usize, usize) {
+    unsafe { (sym(&__estack_bottom), sym(&__estack_top)) }
 }
 
 /// The reserved vault region as a mutable static slice. Must be called at most

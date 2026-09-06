@@ -74,6 +74,18 @@ SECTIONS
     . = . + 0x00040000;        /* 256 KiB network scratch region */
     __netbuf_end = .;
 
+    /* Dedicated exception stack. EL1 CPU faults (data/instruction aborts, the
+       fatal synchronous/SError vectors) switch SP to the top of this region on
+       entry, before the trap frame is pushed, so a fault taken while the main
+       kernel stack is exhausted saves its frame here instead of scribbling the
+       272-byte frame below the stack guard page into the heap. IRQ and SVC entry
+       keep using the per-task stack, so the scheduler context-switch model is
+       unchanged. */
+    . = ALIGN(4096);
+    __estack_bottom = .;
+    . = . + 0x00020000;        /* 128 KiB exception stack */
+    __estack_top = .;
+
     /* Dedicated EL0 user region, 2 MiB aligned and 2 MiB in size so exactly one
        level-2 entry can be refined into a page table without touching any kernel
        mapping. Page 0 is the user code page, page 1 the user stack. */

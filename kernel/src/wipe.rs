@@ -113,8 +113,17 @@ pub fn wipe() -> WipeReport {
     // stack frame live here; the live frames above SP (this wipe's own frames)
     // are left untouched. Leave a small guard below SP so the scrub loop's own
     // stack use is never overwritten mid-flight.
-    let (sb, _st) = mem::stack_region_range();
-    let se = (sp_now().saturating_sub(256)) & !0xF;
+    let (sb, st) = mem::stack_region_range();
+    let sp = sp_now();
+    // When the wipe runs on the main kernel stack, scrub the free part below the
+    // live frames. When it runs from a fault on the dedicated exception stack, the
+    // whole main stack is free (nothing is running on it), so scrub it entirely,
+    // which also covers anything an overflow scribbled near the bottom.
+    let se = if sp > sb && sp <= st {
+        (sp.saturating_sub(256)) & !0xF
+    } else {
+        st
+    };
     let stack_bytes = se.saturating_sub(sb);
     if stack_bytes > 0 {
         scrub(sb, se);

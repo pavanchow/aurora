@@ -118,8 +118,30 @@ el1h_irq:
     RESTORE_CTX
     eret
 
-// Synchronous from EL1h: SVC syscalls and CPU faults.
+// Synchronous from EL1h: SVC syscalls and CPU faults. An SVC must save its trap
+// frame on the per-task stack (the scheduler switches tasks by returning a
+// different frame pointer), so its path is unchanged. A CPU fault instead
+// switches SP to the dedicated exception stack BEFORE saving the frame, so a
+// fault taken on an exhausted stack cannot push the 272-byte frame below the
+// stack guard page into the heap. ESR is peeked with x0 stashed in tpidr_el1 so
+// no syscall-argument register is disturbed on the SVC path.
 el1h_sync:
+    msr     tpidr_el1, x0
+    mrs     x0, esr_el1
+    lsr     x0, x0, #26
+    cmp     x0, #0x15                // EC 0b010101 = SVC from AArch64
+    b.ne    0f
+    mrs     x0, tpidr_el1
+    SAVE_CTX
+    mov     x0, sp
+    bl      rust_sync_handler
+    mov     sp, x0
+    RESTORE_CTX
+    eret
+0:
+    ldr     x0, =__estack_top
+    mov     sp, x0
+    mrs     x0, tpidr_el1
     SAVE_CTX
     mov     x0, sp
     bl      rust_sync_handler
@@ -135,7 +157,11 @@ lower64_sync:
     RESTORE_CTX
     eret
 
+// The fatal fault vectors never return and never context-switch, so they always
+// switch to the dedicated exception stack before saving the trap frame.
 el1t_sync:
+    ldr     x0, =__estack_top
+    mov     sp, x0
     SAVE_CTX
     mov     x0, sp
     mov     x1, #0
@@ -151,6 +177,8 @@ el1t_irq:
     eret
 
 el1t_err:
+    ldr     x0, =__estack_top
+    mov     sp, x0
     SAVE_CTX
     mov     x0, sp
     mov     x1, #1
@@ -158,6 +186,8 @@ el1t_err:
     b       .
 
 el1h_err:
+    ldr     x0, =__estack_top
+    mov     sp, x0
     SAVE_CTX
     mov     x0, sp
     mov     x1, #2
@@ -241,6 +271,19 @@ extern "C" fn rust_fault_handler(sp: usize, kind: u64) -> ! {
     println!("  ELR     = {:#018x}", frame.elr);
     println!("  SPSR    = {:#018x}", frame.spsr);
     println!("  {}", describe_ec(ec));
+
+    // Prove the fault edge is closed: the trap frame was saved on the dedicated
+    // exception stack, not pushed below the stack guard page into the heap. This
+    // holds even when the fault is a stack overflow, because SP is switched to the
+    // exception stack in the vector before the frame is saved.
+    let (es, ee) = crate::mem::estack_region_range();
+    let (hs, he) = crate::mem::heap_region_range();
+    let on_estack = sp >= es && sp < ee;
+    let in_heap = sp >= hs && sp < he;
+    println!(
+        "[fault] trap frame at {:#018x}: on exception stack = {}, in heap = {}",
+        sp, on_estack, in_heap
+    );
 
     // An unrecoverable EL1 fault is a kill-switch trigger: scrub session RAM
     // before halting so a crash cannot leave the key, vault, or fetched bytes
