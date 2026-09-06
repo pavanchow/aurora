@@ -237,7 +237,8 @@ extern "C" fn rust_sync_handler(sp: usize) -> usize {
     let ec = esr >> 26;
     // EC 0b010101 = SVC instruction from AArch64.
     if ec == 0b010101 {
-        syscall::dispatch(sp)
+        // SVC taken from EL1: a trusted in-kernel caller, pointers not checked.
+        syscall::dispatch(sp, false)
     } else {
         rust_fault_handler(sp, 3)
     }
@@ -252,7 +253,8 @@ extern "C" fn rust_lower_sync_handler(sp: usize) -> usize {
     let esr = esr_el1();
     let ec = esr >> 26;
     if ec == 0b010101 {
-        syscall::dispatch(sp)
+        // SVC taken from EL0: an untrusted user task, every (ptr, len) validated.
+        syscall::dispatch(sp, true)
     } else {
         crate::isolation::handle_el0_fault(esr, far_el1())
     }

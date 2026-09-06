@@ -54,6 +54,13 @@ pub fn user_stack_top() -> usize {
     user_stack_page() + PAGE_SIZE
 }
 
+/// The EL0-accessible user region `[start, end)`: the user code page and the user
+/// stack page, contiguous. A syscall pointer+len supplied by an EL0 task must lie
+/// wholly inside this range (see `uaccess` and `syscall::dispatch`).
+pub fn user_region_range() -> (usize, usize) {
+    (user_code_addr(), user_stack_top())
+}
+
 pub fn init() {
     unsafe {
         let l1 = addr_of!(L1) as *mut u64;

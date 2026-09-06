@@ -461,6 +461,13 @@ require "EL0 legit syscall works"  "EL0 user task ran a legit 'write' syscall"
 require "EL0 faults on vault"      "EL0 fault: data abort"
 require "EL0 access denied"        "DENIED: EL0 cannot read kernel/vault RAM"
 
+# EL0 syscall pointer validation: an out-of-region pointer, an absurd length, and
+# a bad pointer to a message-family syscall must all be rejected cleanly at EL1 as
+# EFAULT (no fault, no panic), while the legit in-region write above still works.
+require "EL0 bad pointer rejected"     "range outside user region"
+require "EL0 absurd length rejected"   "length exceeds max"
+require "EL0 msg-family ptr validated" "DENIED EL0 syscall 7"
+
 # Connectivity: virtio-net comes up, negotiates VERSION_1, and does a real
 # request/response round trip over QEMU user-net (ARP + ICMP echo).
 require "virtio-net negotiated"    "negotiated VERSION_1"

@@ -8,7 +8,7 @@
 use core::arch::asm;
 
 use crate::exceptions::TrapFrame;
-use crate::{println, sched, session, timer, uart, wipe};
+use crate::{mmu, println, sched, session, timer, uaccess, uart, wipe};
 
 pub const SYS_WRITE: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
@@ -22,15 +22,53 @@ pub const SYS_MSG_RECV: u64 = 8;
 pub const SYS_REQUEST_CAP: u64 = 9;
 pub const SYS_COMPUTE: u64 = 10;
 
+/// Error returned to EL0 when a supplied (ptr, len) fails validation. A large
+/// sentinel value, distinct from any legitimate byte count.
+const EFAULT: u64 = u64::MAX;
+
+/// Upper bound on an EL0-supplied buffer length. The user region is only two 4
+/// KiB pages, so this sits far above any legitimate user buffer while still
+/// catching absurd lengths early (and before any pointer arithmetic).
+const MAX_USER_LEN: usize = 64 * 1024;
+
+/// Validate an EL0-supplied `(ptr, len)` against the calling task's user region
+/// before the kernel forms a slice from it. On failure, print a diagnostic and
+/// return false so the caller can return `EFAULT` without ever dereferencing the
+/// pointer. Only applied to syscalls entered from EL0; EL1 kernel callers pass
+/// trusted kernel pointers and are not checked.
+fn el0_range_ok(num: u64, ptr: usize, len: usize) -> bool {
+    let (start, end) = mmu::user_region_range();
+    if uaccess::range_in_region(ptr, len, start, end, MAX_USER_LEN) {
+        return true;
+    }
+    let reason = if len > MAX_USER_LEN {
+        "length exceeds max"
+    } else {
+        "range outside user region"
+    };
+    println!(
+        "[uaccess] DENIED EL0 syscall {} ptr={:#x} len={}: {}, returning EFAULT",
+        num, ptr, len, reason
+    );
+    false
+}
+
 /// Dispatch a syscall from the trap frame at `sp`. Returns the stack pointer to
-/// restore (unchanged, except for `yield`/`exit` which switch tasks).
-pub fn dispatch(sp: usize) -> usize {
+/// restore (unchanged, except for `yield`/`exit` which switch tasks). `from_el0`
+/// is true when the SVC was taken from a lower EL (an untrusted user task), which
+/// gates the pointer validation on every syscall that forms a slice from an
+/// EL0-supplied (ptr, len).
+pub fn dispatch(sp: usize, from_el0: bool) -> usize {
     let frame = unsafe { &mut *(sp as *mut TrapFrame) };
     let num = frame.x[8];
     match num {
         SYS_WRITE => {
             let ptr = frame.x[0] as *const u8;
             let len = frame.x[1] as usize;
+            if from_el0 && !el0_range_ok(num, frame.x[0] as usize, len) {
+                frame.x[0] = EFAULT;
+                return sp;
+            }
             let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
             let u = uart::UART.lock();
             for &b in bytes {
@@ -68,6 +106,10 @@ pub fn dispatch(sp: usize) -> usize {
             sp
         }
         SYS_RUN_TASK => {
+            if from_el0 && !el0_range_ok(num, frame.x[0] as usize, frame.x[1] as usize) {
+                frame.x[0] = EFAULT;
+                return sp;
+            }
             let name = str_arg(frame.x[0], frame.x[1]);
             frame.x[0] = session::run_task(name) as u64;
             sp
@@ -75,6 +117,10 @@ pub fn dispatch(sp: usize) -> usize {
         SYS_MSG_SEND => {
             let ptr = frame.x[0] as *const u8;
             let len = frame.x[1] as usize;
+            if from_el0 && !el0_range_ok(num, frame.x[0] as usize, len) {
+                frame.x[0] = EFAULT;
+                return sp;
+            }
             let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
             frame.x[0] = session::msg_send(bytes) as u64;
             sp
@@ -82,6 +128,10 @@ pub fn dispatch(sp: usize) -> usize {
         SYS_MSG_RECV => {
             let ptr = frame.x[0] as *mut u8;
             let cap = frame.x[1] as usize;
+            if from_el0 && !el0_range_ok(num, frame.x[0] as usize, cap) {
+                frame.x[0] = EFAULT;
+                return sp;
+            }
             let out = unsafe { core::slice::from_raw_parts_mut(ptr, cap) };
             frame.x[0] = session::msg_recv(out).map(|n| n as u64).unwrap_or(u64::MAX);
             sp
@@ -91,6 +141,10 @@ pub fn dispatch(sp: usize) -> usize {
             sp
         }
         SYS_COMPUTE => {
+            if from_el0 && !el0_range_ok(num, frame.x[0] as usize, frame.x[1] as usize) {
+                frame.x[0] = EFAULT;
+                return sp;
+            }
             let src = str_arg(frame.x[0], frame.x[1]);
             frame.x[0] = session::compute(src) as u64;
             sp

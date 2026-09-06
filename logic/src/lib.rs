@@ -45,6 +45,12 @@ pub mod ptable;
 #[path = "../../kernel/src/proto.rs"]
 pub mod proto;
 
+// The EL0 syscall pointer-range validator, mounted from the exact kernel source
+// so `cargo test` exercises the same bounds check the kernel runs. It is pure (no
+// `asm!`, no MMIO), so it builds and is unit-tested on the host.
+#[path = "../../kernel/src/uaccess.rs"]
+pub mod uaccess;
+
 #[path = "../../kernel/src/runqueue.rs"]
 pub mod runqueue;
 

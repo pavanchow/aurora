@@ -38,6 +38,7 @@ mod sync;
 mod syscall;
 mod timer;
 mod tls;
+mod uaccess;
 mod uart;
 mod vault;
 mod wipe;
