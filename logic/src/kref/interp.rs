@@ -238,8 +238,7 @@ impl Interp {
         };
         if args.len() != f.decl.params.len() {
             return Err(format!(
-                "function '{}' expects {} arguments, got {}",
-                f.decl.name,
+                "wrong number of arguments (expected {}, got {})",
                 f.decl.params.len(),
                 args.len()
             ));

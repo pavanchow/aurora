@@ -368,7 +368,7 @@ impl Vm {
                 }
                 OP_CALL => {
                     let argc = self.read_byte(program, frame) as usize;
-                    self.call_value(argc)?;
+                    self.call_value(argc, program)?;
                 }
                 OP_CLOSURE => {
                     let idx = self.read_short(program, frame) as usize;
@@ -444,7 +444,7 @@ impl Vm {
         }
     }
 
-    fn call_value(&mut self, argc: usize) -> Result<(), String> {
+    fn call_value(&mut self, argc: usize, program: &Program) -> Result<(), String> {
         let callee = self.peek(argc);
         let r = match callee {
             Value::Obj(r) => r,
@@ -454,6 +454,12 @@ impl Vm {
             Obj::Closure(c) => c.func,
             _ => return Err("can only call functions".into()),
         };
+        let arity = program.funcs[func].arity;
+        if argc != arity {
+            return Err(format!(
+                "wrong number of arguments (expected {arity}, got {argc})"
+            ));
+        }
         if let Some(limit) = self.depth_limit {
             if self.frames.len() >= limit {
                 return Err("recursion limit exceeded".into());
@@ -766,6 +772,40 @@ mod tests {
             out.len()
         );
         assert!(out.contains("output truncated"), "missing notice: {out}");
+    }
+
+    #[test]
+    fn too_few_args_is_clean_error_not_panic() {
+        // Previously read past the value stack top and panicked the kernel.
+        let e = run_err("fn f(a){return a;} return f();", |_| {});
+        assert!(
+            e.contains("wrong number of arguments (expected 1, got 0)"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn missing_arg_does_not_stale_read() {
+        // Previously returned 18 by reading a stale slot for the missing `b`.
+        let e = run_err("fn f(a,b){return a+b;} return f(9);", |_| {});
+        assert!(
+            e.contains("wrong number of arguments (expected 2, got 1)"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn too_many_args_is_error() {
+        let e = run_err("fn g(){return 42;} return g(1,2,3);", |_| {});
+        assert!(
+            e.contains("wrong number of arguments (expected 0, got 3)"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn exact_arity_still_runs() {
+        assert_eq!(run("fn f(a,b){return a+b;} return f(9,9);"), Outcome::Int(18));
     }
 
     #[test]
