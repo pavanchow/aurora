@@ -469,6 +469,26 @@ the current time. A `-k` insecure/pinned mode is available for the deterministic
 local self-test, where the point is to prove the record layer, handshake, and
 HTTP-over-TLS end to end against a self-signed server.
 
+The handshake carries a total work budget so a peer cannot pin the single core.
+A record read only bounds an idle connection, one where no bytes are arriving, so
+a peer that streams records which never advance the handshake, for example a flood
+of trivial 6-byte ChangeCipherSpec records the ServerHello loop skips with a bare
+`continue`, would otherwise look like steady progress and spin the core for as
+long as it kept sending. Every record read across the whole exchange (the
+plaintext ServerHello loop, the encrypted handshake flight, and the post-handshake
+application-data read) is charged against one `HandshakeBudget` in
+`kernel/src/tls.rs` that caps both the total records (512) and the total bytes
+(512 KiB). The charge counts every record, including the types the loops skip, so
+no record type can be used to spin. A real TLS 1.3 handshake is a handful of
+records and a few kilobytes, far under either ceiling, so legitimate peers never
+see it. When either bound is crossed the handshake aborts with a clean `tls
+handshake exceeded record/byte budget` error that propagates up, so `fetch` and
+`tlsinfo` print a prompt failure and the shell keeps running instead of hanging
+for the full network timeout. The boot test proves it with a separate QEMU run
+against a local server that floods ChangeCipherSpec records without end: the fetch
+returns the budget error in about a second, the shell answers a normal command,
+and QEMU exits cleanly, where the old code would have been killed by the watchdog.
+
 Amnesia extends to TLS. The x25519 private key, all of the traffic secrets and
 keys, the transcript state, and the decrypted response plaintext live in the
 reserved network region (`TlsScratch` inside the netbuf region), so a wipe scrubs

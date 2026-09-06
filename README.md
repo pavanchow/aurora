@@ -102,8 +102,12 @@ throwaway compute.
   root-CA chain anchoring, revocation, and wall-clock date enforcement are not yet
   done and are stated as such. The x25519 private key, every TLS traffic key, and
   the decrypted response plaintext all live in the wiped network region, so a wipe
-  scrubs them. Limits: one connection at a time, HTTP/1.0 over TLS, polled with no
-  congestion control, and no TLS 1.2 fallback.
+  scrubs them. The handshake carries a total work budget (512 records and 512 KiB
+  across the whole exchange), so a peer that floods records which never advance the
+  handshake, such as a ChangeCipherSpec flood, aborts with a clean `tls handshake
+  exceeded record/byte budget` error instead of pinning the single core. Limits:
+  one connection at a time, HTTP/1.0 over TLS, polled with no congestion control,
+  and no TLS 1.2 fallback.
 - Tears down without a trace. On session or task exit that session's memory and
   vault are scrubbed, no shell history is retained, and caches are flushed. A full
   session runs and then leaves RAM clean.
@@ -248,7 +252,10 @@ self-signed Ed25519 leaf, ChaCha20 only) and asserts that Aurora completes a rea
 TLS 1.3 handshake against it, verifies the ed25519 CertificateVerify against the
 leaf key, reaches authenticated-to-leaf, and returns the exact known payload over
 the encrypted channel. A best-effort `fetch https://example.com/` over the real
-internet is printed but never hard-fails when offline.
+internet is printed but never hard-fails when offline. A separate short run points
+Aurora at a hostile server that floods ChangeCipherSpec records without end and
+asserts that the handshake aborts on its record/byte budget within about a second,
+the shell still answers, and QEMU exits cleanly rather than hanging the core.
 
 Host unit tests for the pure logic that can be checked without hardware, including
 the ChaCha20 and Poly1305 known-answer vectors, the from-scratch TLS 1.3 crypto
