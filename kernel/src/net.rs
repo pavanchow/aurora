@@ -27,7 +27,8 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::proto::{self, DnsResult};
-use crate::{mem, print, println};
+use crate::tls::{self, TrafficKeys};
+use crate::{ed25519, entropy, mem, print, println, x25519, x509};
 
 // virtio-mmio on QEMU virt: 32 slots, 0x200 bytes apart, from 0x0a00_0000.
 const MMIO_BASE: usize = 0x0a00_0000;
@@ -121,6 +122,69 @@ struct Queue {
 #[repr(C, align(4096))]
 struct Buf([u8; BUF_SIZE]);
 
+// TLS working-memory sizes. A TLS 1.3 record ciphertext is at most 2^14+256
+// bytes; the stream reassembly and handshake-flight buffers must hold at least
+// one such record plus a server's full handshake flight (cert chain included).
+const TLS_STREAM_MAX: usize = 34816;
+const TLS_HS_MAX: usize = 16384;
+const TLS_REC_MAX: usize = 17408;
+const TLS_SUBJECT_MAX: usize = 128;
+
+/// The certificate-validation level Aurora actually reached on a connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CertLevel {
+    /// The CertificateVerify signature was verified against the leaf public key
+    /// (the handshake transcript is cryptographically bound to that key) AND the
+    /// SNI host matched the certificate. This is authenticated-to-leaf.
+    AuthenticatedToLeaf,
+    /// The encrypted channel was established and the leaf certificate parsed, but
+    /// its signature scheme is one Aurora does not yet verify (e.g. ECDSA/RSA), so
+    /// the leaf binding was not proven. Documented, never overclaimed.
+    EncryptedUnverified,
+    /// An explicit insecure mode used for the deterministic local self-test.
+    InsecurePinned,
+}
+
+/// All TLS session working memory, resident in the wiped `netbuf` region so a
+/// wipe scrubs the x25519 private key, every traffic key, and the transcript.
+/// The decrypted application plaintext lands in `NetScratch::body`, also wiped.
+#[repr(C, align(4096))]
+struct TlsSession {
+    priv_key: [u8; 32],
+    client_random: [u8; 32],
+    session_id: [u8; 32],
+    server_pub: [u8; 32],
+    ks: tls::KeySchedule,
+    c_hs_secret: [u8; 32],
+    s_hs_secret: [u8; 32],
+    c_hs: TrafficKeys,
+    s_hs: TrafficKeys,
+    c_ap: TrafficKeys,
+    s_ap: TrafficKeys,
+    transcript: tls::Transcript,
+    // Leaf-certificate facts captured while processing the handshake, used to
+    // verify CertificateVerify and to report the validation level.
+    leaf_pub: [u8; 32],
+    leaf_alg: u8, // 0 ed25519, 1 ec-p256, 2 rsa, 3 other
+    th_cert: [u8; 32], // transcript hash through the Certificate message
+    name_ok: bool,
+    leaf_verified: bool,
+    cipher_suite: u16,
+    group: u16,
+    sig_scheme: u16,
+    level: CertLevel,
+    subject: [u8; TLS_SUBJECT_MAX],
+    subject_len: usize,
+}
+
+#[repr(C, align(4096))]
+struct TlsScratch {
+    session: TlsSession,
+    stream: [u8; TLS_STREAM_MAX],
+    hs_buf: [u8; TLS_HS_MAX],
+    rec: [u8; TLS_REC_MAX],
+}
+
 /// All network buffers, laid out in the reserved `netbuf` region so a wipe scrubs
 /// them whole. Never a `static`: it is accessed through the fixed region address
 /// so no fetched byte ever lands in memory the wipe does not cover.
@@ -132,6 +196,7 @@ struct NetScratch {
     tx_buf: Buf,
     rx_scratch: [u8; RX_SCRATCH],
     body: [u8; BODY_MAX],
+    tls: TlsScratch,
 }
 
 /// Raw pointer to the network scratch at the base of the reserved region.
@@ -827,6 +892,498 @@ fn http_get(
     Some((status, body_off, total))
 }
 
+// --- TLS 1.3 client ----------------------------------------------------------
+//
+// A from-scratch TLS 1.3 client (RFC 8446), one connection at a time, offering
+// only TLS_CHACHA20_POLY1305_SHA256 with x25519 key exchange so it reuses the
+// in-tree ChaCha20-Poly1305 AEAD, SHA-256/HKDF, and x25519. The pure protocol
+// logic (key schedule, record framing, message parse/build) lives in `tls.rs`
+// and is host-tested against the RFC 8448 trace; this drives it over the TCP
+// client above. All session secrets live in the wiped `netbuf` region.
+
+#[inline]
+fn nb_tls() -> *mut TlsScratch {
+    unsafe { addr_of_mut!((*nb()).tls) }
+}
+
+/// Pull one TCP segment and append in-order payload to the TLS stream buffer.
+/// Returns `(made_progress, saw_fin)`.
+fn tls_tcp_fill(t: &mut Tcp, stream_len: &mut usize) -> (bool, bool) {
+    let mut seg = [0u8; 1600];
+    match tcp_poll(t, &mut seg) {
+        Some((seq, _ack, flags, dlen)) => {
+            if flags & proto::TCP_RST != 0 {
+                return (false, true);
+            }
+            let mut progress = false;
+            if dlen > 0 {
+                let ts = unsafe { &mut *nb_tls() };
+                let room = TLS_STREAM_MAX.saturating_sub(*stream_len);
+                if seq == t.rcv_nxt && dlen <= room {
+                    ts.stream[*stream_len..*stream_len + dlen].copy_from_slice(&seg[..dlen]);
+                    *stream_len += dlen;
+                    t.rcv_nxt = t.rcv_nxt.wrapping_add(dlen as u32);
+                    progress = true;
+                }
+                // Acknowledge our current cumulative sequence either way; a drop
+                // (out of order or no room) is recovered by the peer retransmit.
+                tcp_send(t, proto::TCP_ACK, &[]);
+            }
+            let mut fin = false;
+            if flags & proto::TCP_FIN != 0 {
+                if seq.wrapping_add(dlen as u32) == t.rcv_nxt {
+                    t.rcv_nxt = t.rcv_nxt.wrapping_add(1);
+                }
+                tcp_send(t, proto::TCP_ACK, &[]);
+                fin = true;
+                progress = true;
+            }
+            (progress, fin)
+        }
+        None => (false, false),
+    }
+}
+
+/// Read exactly one TLS record into `nb().tls.rec`, consuming it from the stream
+/// buffer. Returns the record length, or None on close/timeout/oversize.
+fn tls_read_record(t: &mut Tcp, stream_len: &mut usize) -> Option<usize> {
+    let mut idle = 0;
+    let mut fin = false;
+    loop {
+        if *stream_len >= 5 {
+            let ts = unsafe { &mut *nb_tls() };
+            let len = ((ts.stream[3] as usize) << 8) | ts.stream[4] as usize;
+            let total = 5 + len;
+            if total > TLS_REC_MAX {
+                return None;
+            }
+            if total <= *stream_len {
+                ts.rec[..total].copy_from_slice(&ts.stream[..total]);
+                ts.stream.copy_within(total..*stream_len, 0);
+                *stream_len -= total;
+                return Some(total);
+            }
+        }
+        if fin {
+            return None;
+        }
+        let (prog, f) = tls_tcp_fill(t, stream_len);
+        if f {
+            fin = true;
+        }
+        if prog {
+            idle = 0;
+        } else {
+            idle += 1;
+            if idle >= 12 {
+                return None;
+            }
+        }
+    }
+}
+
+/// Send a byte buffer over TCP as one or more PSH|ACK segments.
+fn tls_tcp_send(t: &mut Tcp, data: &[u8]) {
+    let mut off = 0;
+    while off < data.len() {
+        let n = core::cmp::min(1400, data.len() - off);
+        tcp_send(t, proto::TCP_PSH | proto::TCP_ACK, &data[off..off + n]);
+        t.snd_nxt = t.snd_nxt.wrapping_add(n as u32);
+        off += n;
+    }
+}
+
+/// Drain and process every complete handshake message currently buffered in
+/// `nb().tls.hs_buf`, updating the transcript and TLS state. Returns Some(true)
+/// once the server Finished has been verified, Some(false) if it needs more
+/// bytes, or None on a fatal handshake error.
+fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Option<bool> {
+    loop {
+        let (mtype, msg_total) = {
+            let ts = unsafe { &*nb_tls() };
+            if *hs_len < 4 {
+                return Some(false);
+            }
+            let blen = ((ts.hs_buf[1] as usize) << 16)
+                | ((ts.hs_buf[2] as usize) << 8)
+                | ts.hs_buf[3] as usize;
+            let total = 4 + blen;
+            if total > TLS_HS_MAX {
+                return None;
+            }
+            if *hs_len < total {
+                return Some(false);
+            }
+            (ts.hs_buf[0], total)
+        };
+
+        let mut finished = false;
+        match mtype {
+            tls::HS_ENCRYPTED_EXTENSIONS => {
+                let ts = unsafe { &mut *nb_tls() };
+                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+            }
+            tls::HS_CERTIFICATE => {
+                let ts = unsafe { &mut *nb_tls() };
+                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+                ts.session.subject_len = 0;
+                ts.session.name_ok = false;
+                ts.session.leaf_alg = 3;
+                if let Some(der) = tls::certificate_leaf(&ts.hs_buf[..msg_total]) {
+                    if let Some(cert) = x509::parse_certificate(der) {
+                        if let Some(cn) = cert.subject_cn() {
+                            let n = core::cmp::min(cn.len(), TLS_SUBJECT_MAX);
+                            ts.session.subject[..n].copy_from_slice(&cn[..n]);
+                            ts.session.subject_len = n;
+                        }
+                        ts.session.name_ok = match parse_ipv4(host) {
+                            Some(ip) => cert.matches_ip(&ip),
+                            None => cert.matches_dns(host),
+                        };
+                        ts.session.leaf_alg = match cert.spki_alg {
+                            x509::SpkiAlg::Ed25519 => {
+                                if cert.spki_key.len() == 32 {
+                                    ts.session.leaf_pub.copy_from_slice(cert.spki_key);
+                                }
+                                0
+                            }
+                            x509::SpkiAlg::EcP256 => 1,
+                            x509::SpkiAlg::Rsa => 2,
+                            _ => 3,
+                        };
+                    }
+                }
+                ts.session.th_cert = ts.session.transcript.hash();
+            }
+            tls::HS_CERTIFICATE_VERIFY => {
+                // Copy the pieces we need to the stack, then verify, then extend
+                // the transcript. This keeps the borrows on `nb().tls` disjoint.
+                let mut scheme = 0u16;
+                let mut sig = [0u8; 64];
+                let mut sig_len = 0usize;
+                let (th, leaf_pub, alg, name_ok) = {
+                    let ts = unsafe { &*nb_tls() };
+                    if let Some((sc, s)) = tls::parse_certificate_verify(&ts.hs_buf[..msg_total]) {
+                        scheme = sc;
+                        sig_len = core::cmp::min(s.len(), 64);
+                        sig[..sig_len].copy_from_slice(&s[..sig_len]);
+                    }
+                    (ts.session.th_cert, ts.session.leaf_pub, ts.session.leaf_alg, ts.session.name_ok)
+                };
+                let mut content = [0u8; 130];
+                let clen = tls::certificate_verify_content(&th, &mut content);
+                let verified = scheme == tls::SIG_ED25519
+                    && alg == 0
+                    && sig_len == 64
+                    && ed25519::verify(&leaf_pub, &content[..clen], &sig);
+                let level = if scheme == tls::SIG_ED25519 && alg == 0 {
+                    // We can verify this scheme against the leaf key.
+                    if verified && name_ok {
+                        CertLevel::AuthenticatedToLeaf
+                    } else if insecure {
+                        CertLevel::InsecurePinned
+                    } else {
+                        // A genuine ed25519 authentication failure aborts.
+                        return None;
+                    }
+                } else if insecure {
+                    CertLevel::InsecurePinned
+                } else {
+                    // Scheme Aurora cannot verify yet (ECDSA/RSA): the channel is
+                    // encrypted but the leaf binding is not proven. Stated plainly.
+                    CertLevel::EncryptedUnverified
+                };
+                let ts = unsafe { &mut *nb_tls() };
+                ts.session.sig_scheme = scheme;
+                ts.session.leaf_verified = verified;
+                ts.session.level = level;
+                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+            }
+            tls::HS_FINISHED => {
+                let mut vd = [0u8; 32];
+                let mut vd_len = 0usize;
+                let (th_before, s_secret) = {
+                    let ts = unsafe { &*nb_tls() };
+                    if let Some(v) = tls::parse_finished(&ts.hs_buf[..msg_total]) {
+                        vd_len = core::cmp::min(v.len(), 32);
+                        vd[..vd_len].copy_from_slice(&v[..vd_len]);
+                    }
+                    (ts.session.transcript.hash(), ts.session.s_hs_secret)
+                };
+                let expect = tls::finished_verify_data(&s_secret, &th_before);
+                if vd_len != 32 || expect != vd {
+                    return None;
+                }
+                let ts = unsafe { &mut *nb_tls() };
+                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+                finished = true;
+            }
+            _ => {
+                let ts = unsafe { &mut *nb_tls() };
+                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+            }
+        }
+
+        // Remove the processed message from the front of the buffer.
+        {
+            let ts = unsafe { &mut *nb_tls() };
+            ts.hs_buf.copy_within(msg_total..*hs_len, 0);
+        }
+        *hs_len -= msg_total;
+        if finished {
+            return Some(true);
+        }
+    }
+}
+
+/// Perform the full TLS 1.3 handshake and one HTTP/1.0 GET over the encrypted
+/// channel. The decrypted response lands in the wiped `body` region; returns
+/// `(status, body_offset, total_len)`. `insecure` relaxes certificate policy for
+/// the deterministic local self-test (still runs the full handshake and record
+/// layer). Negotiated facts are recorded in the session for `tlsinfo`.
+fn https_get(
+    dst_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    port: u16,
+    host: &str,
+    path: &str,
+    insecure: bool,
+) -> Option<(u16, usize, usize)> {
+    // Fresh ephemeral key material, all resident in the wiped netbuf session.
+    let priv_key = entropy::session_key();
+    let client_random = entropy::session_key();
+    let session_id = entropy::session_key();
+    let client_pub = x25519::x25519_base(&priv_key);
+    {
+        let s = unsafe { &mut (*nb()).tls.session };
+        s.priv_key = priv_key;
+        s.client_random = client_random;
+        s.session_id = session_id;
+        s.ks = tls::KeySchedule::new();
+        s.transcript = tls::Transcript::new();
+        s.level = CertLevel::EncryptedUnverified;
+        s.leaf_verified = false;
+        s.name_ok = false;
+        s.sig_scheme = 0;
+        s.subject_len = 0;
+        s.cipher_suite = 0;
+        s.group = 0;
+        s.leaf_alg = 3;
+    }
+
+    let mut t = tcp_connect(dst_ip, dst_mac, port)?;
+    let mut stream_len = 0usize;
+
+    // ClientHello, as a plaintext handshake record.
+    let mut ch = [0u8; 512];
+    let chlen = tls::build_client_hello(&client_random, &session_id, &client_pub, host, &mut ch)?;
+    unsafe { (*nb()).tls.session.transcript.update(&ch[..chlen]) };
+    let mut chrec = [0u8; 5 + 512];
+    chrec[0] = tls::CT_HANDSHAKE;
+    chrec[1] = 0x03;
+    chrec[2] = 0x03;
+    chrec[3..5].copy_from_slice(&(chlen as u16).to_be_bytes());
+    chrec[5..5 + chlen].copy_from_slice(&ch[..chlen]);
+    tls_tcp_send(&mut t, &chrec[..5 + chlen]);
+
+    // ServerHello (plaintext handshake record; skip any ChangeCipherSpec).
+    let server_pub;
+    loop {
+        let _total = tls_read_record(&mut t, &mut stream_len)?;
+        let ts = unsafe { &mut *nb_tls() };
+        if ts.rec[0] == tls::CT_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if ts.rec[0] != tls::CT_HANDSHAKE {
+            return None;
+        }
+        let len = ((ts.rec[3] as usize) << 8) | ts.rec[4] as usize;
+        ts.session.transcript.update(&ts.rec[5..5 + len]);
+        let sh = tls::parse_server_hello(&ts.rec[5..5 + len])?;
+        ts.session.cipher_suite = sh.cipher_suite;
+        ts.session.group = sh.group;
+        ts.session.server_pub = sh.server_pub;
+        server_pub = sh.server_pub;
+        break;
+    }
+
+    // Handshake secrets from the ECDHE shared value and the CH..SH transcript.
+    let ecdhe = x25519::x25519(&priv_key, &server_pub);
+    {
+        let s = unsafe { &mut (*nb()).tls.session };
+        s.ks.derive_handshake(&ecdhe);
+        let th = s.transcript.hash();
+        s.c_hs_secret = s.ks.client_hs_traffic(&th);
+        s.s_hs_secret = s.ks.server_hs_traffic(&th);
+        s.c_hs = TrafficKeys::from_secret(&s.c_hs_secret);
+        s.s_hs = TrafficKeys::from_secret(&s.s_hs_secret);
+    }
+
+    // Read and process the encrypted handshake flight (EncryptedExtensions,
+    // Certificate, CertificateVerify, Finished), possibly spanning records.
+    let mut hs_len = 0usize;
+    let mut done = false;
+    while !done {
+        let total = tls_read_record(&mut t, &mut stream_len)?;
+        {
+            let ts = unsafe { &mut *nb_tls() };
+            match ts.rec[0] {
+                tls::CT_CHANGE_CIPHER_SPEC => continue,
+                tls::CT_APPLICATION_DATA => {
+                    let (ct, plen) = tls::open_record(&mut ts.session.s_hs, &mut ts.rec[..total])?;
+                    if ct == tls::CT_ALERT {
+                        return None;
+                    }
+                    if ct != tls::CT_HANDSHAKE {
+                        continue;
+                    }
+                    if hs_len + plen > TLS_HS_MAX {
+                        return None;
+                    }
+                    let (a, b) = (hs_len, hs_len + plen);
+                    let src = &ts.rec[5..5 + plen];
+                    ts.hs_buf[a..b].copy_from_slice(src);
+                    hs_len = b;
+                }
+                _ => return None,
+            }
+        }
+        done = tls_process_handshake(&mut hs_len, host, insecure)?;
+    }
+
+    // Application traffic keys from the CH..server-Finished transcript.
+    let th_sfin;
+    {
+        let s = unsafe { &mut (*nb()).tls.session };
+        s.ks.derive_master();
+        th_sfin = s.transcript.hash();
+        let cap = s.ks.client_ap_traffic(&th_sfin);
+        let sap = s.ks.server_ap_traffic(&th_sfin);
+        s.c_ap = TrafficKeys::from_secret(&cap);
+        s.s_ap = TrafficKeys::from_secret(&sap);
+    }
+
+    // Build the whole client flight into one buffer and send it as a single TCP
+    // write: a plaintext ChangeCipherSpec (middlebox compat), the encrypted
+    // client Finished under the client handshake keys, and the encrypted HTTP/1.0
+    // GET under the client application keys. Sending one segment instead of three
+    // shrinks the surface for a dropped segment on the polled, no-data-retransmit
+    // TCP client.
+    let mut flight = [0u8; 6 + (5 + 4 + 32 + 1 + 16) + (5 + 512 + 1 + 16)];
+    let mut flen = 0;
+    flight[..6].copy_from_slice(&[tls::CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    flen += 6;
+    {
+        let c_secret = unsafe { (*nb()).tls.session.c_hs_secret };
+        let vd = tls::finished_verify_data(&c_secret, &th_sfin);
+        let mut fin_msg = [0u8; 4 + 32];
+        fin_msg[0] = tls::HS_FINISHED;
+        fin_msg[3] = 32;
+        fin_msg[4..].copy_from_slice(&vd);
+        let k = unsafe { &mut (*nb()).tls.session.c_hs };
+        flen += tls::seal_record(k, tls::CT_HANDSHAKE, &fin_msg, &mut flight[flen..])?;
+    }
+    let mut req = [0u8; 512];
+    let mut w = ReqWriter::new(&mut req);
+    w.put(b"GET ");
+    w.put(path.as_bytes());
+    w.put(b" HTTP/1.0\r\nHost: ");
+    w.put(host.as_bytes());
+    w.put(b"\r\nUser-Agent: aurora-tls/1.0\r\nConnection: close\r\n\r\n");
+    let reqlen = w.len();
+    {
+        let k = unsafe { &mut (*nb()).tls.session.c_ap };
+        flen += tls::seal_record(k, tls::CT_APPLICATION_DATA, &req[..reqlen], &mut flight[flen..])?;
+    }
+    tls_tcp_send(&mut t, &flight[..flen]);
+
+    // Read encrypted application records; decrypt into the wiped body region.
+    // Post-handshake handshake messages (NewSessionTicket) are ignored.
+    let mut total_body = 0usize;
+    while let Some(rlen) = tls_read_record(&mut t, &mut stream_len) {
+        let ts = unsafe { &mut *nb_tls() };
+        match ts.rec[0] {
+            tls::CT_CHANGE_CIPHER_SPEC => continue,
+            tls::CT_APPLICATION_DATA => {
+                let (ct, plen) = match tls::open_record(&mut ts.session.s_ap, &mut ts.rec[..rlen]) {
+                    Some(x) => x,
+                    None => break,
+                };
+                match ct {
+                    tls::CT_APPLICATION_DATA => {
+                        let room = BODY_MAX.saturating_sub(total_body);
+                        let take = core::cmp::min(plen, room);
+                        unsafe {
+                            let s = ts.rec.as_ptr().add(5);
+                            let d = (*nb()).body.as_mut_ptr().add(total_body);
+                            core::ptr::copy_nonoverlapping(s, d, take);
+                        }
+                        total_body += take;
+                        if total_body >= BODY_MAX {
+                            break;
+                        }
+                    }
+                    tls::CT_ALERT => break,
+                    _ => { /* NewSessionTicket / KeyUpdate: ignore */ }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    tcp_close(&mut t);
+
+    let resp = unsafe { &(&(*nb()).body)[..total_body] };
+    let (status, body_off) = proto::parse_http_response(resp)?;
+    Some((status, body_off, total_body))
+}
+
+fn cert_level_str(l: CertLevel) -> &'static str {
+    match l {
+        CertLevel::AuthenticatedToLeaf => "authenticated-to-leaf (CertificateVerify bound to leaf key + SNI matched)",
+        CertLevel::EncryptedUnverified => "encrypted, leaf signature scheme not verified by Aurora",
+        CertLevel::InsecurePinned => "insecure/pinned self-test mode",
+    }
+}
+
+fn sig_scheme_str(s: u16) -> &'static str {
+    match s {
+        tls::SIG_ED25519 => "ed25519",
+        tls::SIG_ECDSA_P256_SHA256 => "ecdsa_secp256r1_sha256",
+        tls::SIG_RSA_PSS_RSAE_SHA256 => "rsa_pss_rsae_sha256",
+        tls::SIG_RSA_PKCS1_SHA256 => "rsa_pkcs1_sha256",
+        0 => "none",
+        _ => "other",
+    }
+}
+
+/// Print the negotiated TLS parameters recorded on the last handshake.
+fn print_tls_info() {
+    let s = unsafe { &(*nb()).tls.session };
+    let suite = if s.cipher_suite == tls::TLS_CHACHA20_POLY1305_SHA256 {
+        "TLS_CHACHA20_POLY1305_SHA256"
+    } else {
+        "unknown"
+    };
+    let group = if s.group == tls::GROUP_X25519 { "x25519" } else { "unknown" };
+    println!("[tls] version: TLS 1.3");
+    println!("[tls] cipher suite: {} ({:#06x})", suite, s.cipher_suite);
+    println!("[tls] key exchange group: {} ({:#06x})", group, s.group);
+    println!(
+        "[tls] server CertificateVerify scheme: {} ({:#06x}), leaf signature verified: {}",
+        sig_scheme_str(s.sig_scheme),
+        s.sig_scheme,
+        s.leaf_verified
+    );
+    if s.subject_len > 0 {
+        let subj = core::str::from_utf8(&s.subject[..s.subject_len]).unwrap_or("<binary>");
+        println!("[tls] certificate subject CN: {}", subj);
+    } else {
+        println!("[tls] certificate subject CN: <none>");
+    }
+    println!("[tls] validation level: {}", cert_level_str(s.level));
+}
+
 // --- Shell entry points ------------------------------------------------------
 
 /// Parse `dotted` as an IPv4 address, e.g. "10.0.2.2".
@@ -846,21 +1403,28 @@ fn parse_ipv4(dotted: &str) -> Option<[u8; 4]> {
     Some(out)
 }
 
-/// Split `http://host[:port]/path` into `(host, port, path)`.
-fn parse_url(url: &str) -> Option<(&str, u16, &str)> {
-    let rest = url.strip_prefix("http://")?;
+/// Split `scheme://host[:port]/path` for http and https. Returns
+/// `(is_tls, host, port, path)` with the default port per scheme.
+fn parse_url_scheme(url: &str) -> Option<(bool, &str, u16, &str)> {
+    let (tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r, 80u16)
+    } else {
+        return None;
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let (host, port) = match authority.rfind(':') {
         Some(i) => (&authority[..i], authority[i + 1..].parse::<u16>().ok()?),
-        None => (authority, 80u16),
+        None => (authority, default_port),
     };
     if host.is_empty() {
         return None;
     }
-    Some((host, port, path))
+    Some((tls, host, port, path))
 }
 
 /// Resolve a URL host to an IPv4 address: dotted-decimal is used directly, a name
@@ -905,8 +1469,10 @@ fn scan_netbuf(needle: &[u8]) -> u64 {
     count
 }
 
-/// `fetch <url>`: resolve, TCP-connect, HTTP GET, and print the status and body.
-pub fn shell_fetch(url: &str) {
+/// `fetch [-k] <url>`: resolve, connect, GET, and print the status and body. An
+/// `https://` URL runs the from-scratch TLS 1.3 client over TCP 443; `-k` selects
+/// the insecure/pinned mode for the deterministic local self-test.
+pub fn shell_fetch(args: &str) {
     if !crate::session::has_net() {
         println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
         return;
@@ -915,14 +1481,19 @@ pub fn shell_fetch(url: &str) {
         println!("[net] device unavailable");
         return;
     }
-    let (host, port, path) = match parse_url(url) {
+    let (insecure, url) = match args.strip_prefix("-k") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, args),
+    };
+    let (is_tls, host, port, path) = match parse_url_scheme(url) {
         Some(x) => x,
         None => {
-            println!("[fetch] bad url (expected http://host[:port]/path)");
+            println!("[fetch] bad url (expected http(s)://host[:port]/path)");
             return;
         }
     };
-    print!("[fetch] GET http://{}:{}{} -> resolving {} ... ", host, port, path, host);
+    let scheme = if is_tls { "https" } else { "http" };
+    print!("[fetch] GET {}://{}:{}{} -> resolving {} ... ", scheme, host, port, path, host);
     let ip = match resolve_host(host) {
         Some(ip) => {
             print_ip(ip);
@@ -941,8 +1512,16 @@ pub fn shell_fetch(url: &str) {
             return;
         }
     };
-    match http_get(ip, mac, port, host, path) {
+    let result = if is_tls {
+        https_get(ip, mac, port, host, path, insecure)
+    } else {
+        http_get(ip, mac, port, host, path)
+    };
+    match result {
         Some((status, body_off, total)) => {
+            if is_tls {
+                print_tls_info();
+            }
             let body_len = total.saturating_sub(body_off);
             println!("[fetch] HTTP status: {}, body {} bytes", status, body_len);
             // Print a bounded slice of the body so a large response cannot flood
@@ -960,7 +1539,62 @@ pub fn shell_fetch(url: &str) {
             }
             println!();
         }
-        None => println!("[fetch] request failed (no response / bad HTTP)"),
+        None => println!("[fetch] request failed (no response / TLS or HTTP error)"),
+    }
+}
+
+/// `tlsinfo [-k] <https-url|host>`: run a TLS 1.3 handshake and print the
+/// negotiated group, cipher suite, certificate subject, and validation level.
+pub fn shell_tlsinfo(args: &str) {
+    if !crate::session::has_net() {
+        println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
+        return;
+    }
+    if !init() {
+        println!("[net] device unavailable");
+        return;
+    }
+    let (insecure, rest) = match args.strip_prefix("-k") {
+        Some(r) => (true, r.trim_start()),
+        None => (false, args),
+    };
+    // Accept a bare host or a full https URL.
+    let (host, port, path) = if rest.starts_with("http") {
+        match parse_url_scheme(rest) {
+            Some((_, h, p, pa)) => (h, p, pa),
+            None => {
+                println!("[tlsinfo] bad url");
+                return;
+            }
+        }
+    } else {
+        (rest, 443u16, "/")
+    };
+    print!("[tlsinfo] handshaking with {}:{} ... ", host, port);
+    let ip = match resolve_host(host) {
+        Some(ip) => {
+            print_ip(ip);
+            println!();
+            ip
+        }
+        None => {
+            println!("FAILED (dns)");
+            return;
+        }
+    };
+    let mac = match next_hop_mac(ip) {
+        Some(m) => m,
+        None => {
+            println!("[tlsinfo] ARP failed for next hop");
+            return;
+        }
+    };
+    match https_get(ip, mac, port, host, path, insecure) {
+        Some((status, _off, _total)) => {
+            print_tls_info();
+            println!("[tlsinfo] handshake ok, server answered HTTP {}", status);
+        }
+        None => println!("[tlsinfo] handshake failed"),
     }
 }
 
@@ -995,7 +1629,7 @@ pub fn shell_resolve(args: &str) {
 /// `netamnesia <url>`: fetch a payload carrying a known sentinel into the network
 /// buffers, confirm it is present, wipe, then prove the sentinel is gone from the
 /// whole netbuf region. This extends the amnesia proof to fetched network bytes.
-pub fn shell_netamnesia(url: &str) {
+pub fn shell_netamnesia(args: &str) {
     if !crate::session::has_net() {
         println!("[net] denied: session inactive or missing CAP_NET (try 'cap net')");
         return;
@@ -1004,8 +1638,12 @@ pub fn shell_netamnesia(url: &str) {
         println!("[net] device unavailable");
         return;
     }
+    let (insecure, url) = match args.strip_prefix("-k") {
+        Some(r) => (true, r.trim_start()),
+        None => (false, args),
+    };
     println!("[netamnesia] === proving fetched network bytes do not survive a wipe ===");
-    let (host, port, path) = match parse_url(url) {
+    let (is_tls, host, port, path) = match parse_url_scheme(url) {
         Some(x) => x,
         None => {
             println!("[netamnesia] bad url");
@@ -1026,7 +1664,14 @@ pub fn shell_netamnesia(url: &str) {
             return;
         }
     };
-    let ok = http_get(ip, mac, port, host, path).is_some();
+    let ok = if is_tls {
+        https_get(ip, mac, port, host, path, insecure).is_some()
+    } else {
+        http_get(ip, mac, port, host, path).is_some()
+    };
+    if is_tls {
+        println!("[netamnesia] fetched over TLS 1.3; the decrypted body lives in the wiped netbuf region");
+    }
     let pre = scan_netbuf(NET_SENTINEL);
     println!(
         "[netamnesia] fetched (ok={}); sentinel appears {} time(s) in the network buffers before wipe",

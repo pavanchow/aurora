@@ -62,9 +62,10 @@ pub fn exec(line: &str) -> bool {
             println!("  cap net              grant the revocable network capability");
             println!("  cap revoke net       revoke the network capability");
             println!("  net <msg>            round-trip a message over CAP_NET (needs CAP_NET)");
-            println!("  fetch <url>          HTTP/1.0 GET http://host[:port]/path (needs CAP_NET)");
+            println!("  fetch [-k] <url>     HTTP/1.0 GET over http:// or TLS 1.3 https:// (needs CAP_NET)");
+            println!("  tlsinfo [-k] <host>  TLS 1.3 handshake, show group/suite/cert (needs CAP_NET)");
             println!("  resolve <name> [ns]  live DNS A-record lookup (needs CAP_NET)");
-            println!("  netamnesia <url>     prove fetched bytes do not survive a wipe");
+            println!("  netamnesia [-k] <url> prove fetched bytes (incl. TLS plaintext) do not survive a wipe");
             println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
             println!("  panic                trigger a kernel panic (wipes on the way down)");
@@ -186,6 +187,14 @@ pub fn exec(line: &str) -> bool {
                 println!("usage: fetch http://host[:port]/path");
             } else {
                 crate::net::shell_fetch(rest);
+            }
+        }
+        "tlsinfo" => {
+            let rest = line.strip_prefix("tlsinfo").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("usage: tlsinfo [-k] <https://host[:port]/path | host>");
+            } else {
+                crate::net::shell_tlsinfo(rest);
             }
         }
         "resolve" => {
