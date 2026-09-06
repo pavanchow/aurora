@@ -9,6 +9,21 @@
 #[path = "../../kernel/src/crypto.rs"]
 pub mod crypto;
 
+#[path = "../../kernel/src/sha2.rs"]
+pub mod sha2;
+
+#[path = "../../kernel/src/x25519.rs"]
+pub mod x25519;
+
+#[path = "../../kernel/src/ed25519.rs"]
+pub mod ed25519;
+
+#[path = "../../kernel/src/x509.rs"]
+pub mod x509;
+
+#[path = "../../kernel/src/tls.rs"]
+pub mod tls;
+
 #[path = "../../kernel/src/frame_alloc.rs"]
 pub mod frame_alloc;
 

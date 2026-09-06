@@ -14,6 +14,7 @@ extern crate alloc;
 mod amnesia;
 mod boot;
 mod crypto;
+mod ed25519;
 mod entropy;
 mod exceptions;
 mod frame_alloc;
@@ -30,13 +31,17 @@ mod ptable;
 mod runqueue;
 mod sched;
 mod session;
+mod sha2;
 mod shell;
 mod sync;
 mod syscall;
 mod timer;
+mod tls;
 mod uart;
 mod vault;
 mod wipe;
+mod x25519;
+mod x509;
 
 use core::panic::PanicInfo;
 
