@@ -240,14 +240,31 @@ Compute is exposed as a syscall gated by CAP_COMPUTE and driven from the shell.
 `compute <expr>` runs a one-line program, and a bare `compute` reads lines until a
 lone `.` and runs the whole program. A Kindling program has no file, network, or
 system access, it can only compute and print, which makes it a safe compute
-surface for an untrusted agent. Three resource limits keep a hostile program from
+surface for an untrusted agent. Resource limits keep a hostile program from
 taking down the OS, and each trips a clean Kindling runtime error rather than a
 kernel panic or OOM. A step limit bounds total executed instructions so a runaway
 loop cannot hang the single core. A call-depth limit (1024 frames) turns unbounded
 recursion into a "recursion limit exceeded" error instead of exhausting the stack
-and heap. A live-heap ceiling (256 KiB, well under the 4 MiB kernel heap) turns an
-ever-growing value into a "compute memory limit exceeded" error instead of OOMing
-the global allocator.
+and heap.
+
+The memory ceiling is a single TOTAL per-run budget, not a per-arena one. An
+earlier version measured only the GC object heap, so a program could still OOM
+the kernel by growing an allocation that lives outside that arena: deep recursion
+that keeps many locals live on the VM value stack, or a plain print inside a loop
+that grows the accumulated output string. Both grew until the global 4 MiB
+allocator returned null and the kernel panic-halted. The budget now counts the
+whole agent-growable footprint of a run, the GC object heap plus the value stack
+plus the accumulated output plus the call frames plus the globals, against one
+ceiling (256 KiB, well under the 4 MiB kernel heap), checked before every
+instruction (so before any arena grows). Any growth that crosses the line returns
+"compute memory limit exceeded" and the shell keeps running. Because the ceiling
+is far below the kernel heap and is checked before each step, a compute program
+can never reach the allocator's failure path, so `handle_alloc_error` is never hit
+from a compute run. Two explicit sub-caps back the total budget as defense in
+depth: the value stack has its own byte ceiling, and the output is capped at
+64 KiB and truncated with a notice rather than grown without bound. The
+panic-then-wipe behavior is untouched for genuine unexpected OOM elsewhere in the
+kernel.
 
 Those three are runtime limits, but the compile step in front of the VM recurses
 too, and that was the source of a whole class of parser crashes. A deeply nested
@@ -549,10 +566,13 @@ then asserts the markers that can only appear if each subsystem worked:
 - a Kindling program running in-session that prints 76127 for the sum of primes
   below 1000 and confirms 561 is a Carmichael number, plus two parameterized
   compute calls giving input-dependent results,
-- the compute resource-isolation probe, two hostile Kindling programs (unbounded
-  recursion and an ever-growing value) that each trip a clean limit error, after
-  which a normal `compute 123 + 456` still answers 579, proving a user program
-  cannot crash the kernel and the shell survives,
+- the compute resource-isolation probe, hostile Kindling programs (unbounded
+  recursion, an ever-growing GC value, deep recursion that piles locals on the
+  value stack, and a print loop that grows the output) that each trip a clean
+  limit error or an output-truncation notice, after which a distinctive normal
+  compute still answers (579, 777, 888), proving a user program cannot crash the
+  kernel and the shell survives, and asserting no allocator failure or halt fires
+  on any compute run,
 - the EL0 isolation probe, an EL0 task that makes a legitimate syscall and then
   faults reading the vault directly, with the kernel reporting the denial and
   continuing,

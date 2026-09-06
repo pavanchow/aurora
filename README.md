@@ -59,11 +59,18 @@ throwaway compute.
 - Runs a sandboxed in-OS interpreter. The from-scratch Kindling bytecode language
   (lexer, parser, compiler, stack VM, garbage collector, zero dependencies) is
   embedded in the kernel and gated by CAP_COMPUTE. A Kindling program has no file,
-  network, or system access, it can only compute and print, and three runtime
-  resource limits (instruction count, call depth, and live heap bytes) stop a
-  runaway or hostile program: unbounded recursion and ever-growing allocation
-  each return a clean runtime error instead of crashing the kernel, and the shell
-  keeps running. Compile-time bounds close the parser off too: one uniform depth
+  network, or system access, it can only compute and print, and runtime resource
+  limits stop a runaway or hostile program. The memory ceiling is a single total
+  per-run budget across every agent-growable arena (the GC object heap, the value
+  stack, the accumulated output, the call frames, and the globals), not just the
+  GC heap, checked before every instruction, so unbounded recursion, an
+  ever-growing value, deep recursion that piles locals on the value stack, and a
+  print loop that grows the output all return a clean runtime error (or an
+  output-truncation notice) instead of crashing the kernel, and the shell keeps
+  running. The budget trips well below the 4 MiB kernel heap, so a compute program
+  can never reach the allocator failure path. Output is additionally capped at
+  64 KiB and truncated with a notice. Compile-time bounds close the parser off
+  too: one uniform depth
   cap covers every recursive production (grouping, unary, calls, assignment
   chains, nested blocks, `if`/`while`, and long operator chains), and a total
   program-size and AST-node budget reject an oversized program, so a deeply nested
@@ -212,9 +219,13 @@ The compute surface is a real language. `compute 40 + 2` prints 42, and a
 multi-line program can define functions, loop, and print. For example, entering
 `compute` and then a program that sums the primes below 1000 prints 76127, and a
 program that factors 561 confirms it is a Carmichael number. It is also sandboxed
-for resources: a program that recurses forever or builds an ever-growing value
+for resources: a program that recurses forever, builds an ever-growing value,
+piles locals on the value stack through deep recursion, or prints in a loop
 returns a clean limit error (`recursion limit exceeded`, `compute memory limit
-exceeded`) instead of crashing the kernel, and the shell keeps accepting commands.
+exceeded`) or a truncated-output notice instead of crashing the kernel, and the
+shell keeps accepting commands. The memory limit is a single total budget across
+every growable arena checked before each instruction, so it trips well before the
+kernel heap is exhausted.
 
 ## Test
 
