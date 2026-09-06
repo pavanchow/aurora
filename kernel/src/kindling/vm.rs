@@ -38,10 +38,25 @@ pub struct Vm {
     /// Cap on the call-frame depth so unbounded recursion returns a clean runtime
     /// error instead of exhausting memory and panicking the kernel. None disables.
     depth_limit: Option<usize>,
-    /// Ceiling on live interpreter-heap bytes for a single run, so a program that
-    /// builds an ever-growing value fails cleanly instead of OOMing the global
-    /// kernel allocator. None disables the cap (host tests).
+    /// Ceiling on TOTAL agent-growable bytes for a single run: the GC object heap
+    /// plus the value stack, the accumulated output, the call frames, and the
+    /// globals. Checked before every instruction so a program that grows any one
+    /// of those arenas fails cleanly instead of OOMing the global kernel
+    /// allocator. None disables the cap (host tests).
     byte_limit: Option<usize>,
+    /// Explicit ceiling on value-stack bytes, defense in depth so deep-locals
+    /// recursion trips the budget cleanly even in isolation. None disables it.
+    stack_limit: Option<usize>,
+    /// Explicit ceiling on accumulated output bytes. On overflow the output is
+    /// truncated with a notice rather than grown without bound, so a print loop
+    /// cannot inflate the run. None disables the cap (host tests).
+    output_limit: Option<usize>,
+    /// Running estimate of the bytes held by `globals`, maintained incrementally
+    /// so the per-instruction budget check stays O(1).
+    globals_bytes: usize,
+    /// Set once the output cap is hit, so the truncation notice is appended only
+    /// once and later prints are dropped instead of growing the string.
+    output_truncated: bool,
 }
 
 impl Default for Vm {
@@ -63,6 +78,10 @@ impl Vm {
             steps: 0,
             depth_limit: None,
             byte_limit: None,
+            stack_limit: None,
+            output_limit: None,
+            globals_bytes: 0,
+            output_truncated: false,
         }
     }
 
@@ -85,10 +104,76 @@ impl Vm {
         self.depth_limit = Some(limit);
     }
 
-    /// Bound live interpreter-heap bytes for the run (kernel safety valve for
-    /// runaway allocation).
+    /// Bound TOTAL agent-growable bytes for the run (kernel safety valve for
+    /// runaway allocation across every arena, not just the GC heap).
     pub fn set_byte_limit(&mut self, limit: usize) {
         self.byte_limit = Some(limit);
+    }
+
+    /// Bound value-stack bytes for the run (defense in depth for deep-locals
+    /// recursion).
+    pub fn set_stack_limit(&mut self, limit: usize) {
+        self.stack_limit = Some(limit);
+    }
+
+    /// Bound accumulated output bytes for the run. Beyond this the output is
+    /// truncated with a notice instead of growing without bound.
+    pub fn set_output_limit(&mut self, limit: usize) {
+        self.output_limit = Some(limit);
+    }
+
+    /// Total agent-growable footprint of this run in bytes: the GC object heap,
+    /// the value stack, the accumulated output, the call frames, and the globals.
+    /// This is what the single per-run ceiling is checked against, so growth in
+    /// any arena (not just the GC heap) trips the budget.
+    fn mem_bytes(&self) -> usize {
+        self.heap.bytes()
+            + self.stack.len() * core::mem::size_of::<Value>()
+            + self.output.len()
+            + self.frames.len() * core::mem::size_of::<Frame>()
+            + self.globals_bytes
+    }
+
+    /// Trip a clean runtime error if the run is over its total budget or the
+    /// explicit value-stack ceiling. Called before every instruction, i.e. before
+    /// any arena grows, so the budget engages long before the global 4 MiB heap is
+    /// exhausted and `handle_alloc_error` can never be reached from a compute run.
+    fn check_budget(&self) -> Result<(), String> {
+        if let Some(limit) = self.byte_limit {
+            if self.mem_bytes() > limit {
+                return Err("compute memory limit exceeded".into());
+            }
+        }
+        if let Some(limit) = self.stack_limit {
+            if self.stack.len() * core::mem::size_of::<Value>() > limit {
+                return Err("compute memory limit exceeded".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Append to the run output, honouring the per-run output cap. Once the cap is
+    /// reached the output is truncated with a one-time notice and further prints
+    /// are dropped, so a print loop cannot grow the run without bound.
+    fn append_output(&mut self, s: &str) {
+        if self.output_truncated {
+            return;
+        }
+        if let Some(limit) = self.output_limit {
+            if self.output.len().saturating_add(s.len()) > limit {
+                let room = limit.saturating_sub(self.output.len());
+                let mut end = room.min(s.len());
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.output.push_str(&s[..end]);
+                self.output
+                    .push_str("\n[output truncated: per-run output limit reached]\n");
+                self.output_truncated = true;
+                return;
+            }
+        }
+        self.output.push_str(s);
     }
 
     pub fn take_output(&mut self) -> String {
@@ -164,11 +249,7 @@ impl Vm {
                 }
             }
             self.maybe_gc();
-            if let Some(limit) = self.byte_limit {
-                if self.heap.bytes() > limit {
-                    return Err("compute memory limit exceeded".into());
-                }
-            }
+            self.check_budget()?;
             let frame = self.frames.len() - 1;
             let op = self.read_byte(program, frame);
             match op {
@@ -217,6 +298,9 @@ impl Vm {
                     let idx = self.read_short(program, frame) as usize;
                     let name = self.const_str(program, frame, idx)?;
                     let v = self.pop();
+                    if !self.globals.contains_key(&name) {
+                        self.globals_bytes += name.len() + core::mem::size_of::<Value>();
+                    }
                     self.globals.insert(name, v);
                 }
                 OP_GET_GLOBAL => {
@@ -327,8 +411,8 @@ impl Vm {
                 OP_PRINT => {
                     let v = self.pop();
                     let s = self.display(v);
-                    self.output.push_str(&s);
-                    self.output.push('\n');
+                    self.append_output(&s);
+                    self.append_output("\n");
                 }
                 other => return Err(format!("unknown opcode {other}")),
             }
@@ -623,6 +707,65 @@ mod tests {
         vm.set_byte_limit(512 * 1024);
         let v = vm.interpret(&program).unwrap();
         assert!(matches!(vm.to_outcome(v), Outcome::Str(_)));
+    }
+
+    fn run_output(src: &str, configure: impl FnOnce(&mut Vm)) -> String {
+        let program = compile(&parse(tokenize(src).unwrap()).unwrap()).unwrap();
+        let mut vm = Vm::new();
+        configure(&mut vm);
+        vm.interpret(&program).unwrap();
+        vm.take_output()
+    }
+
+    #[test]
+    fn total_budget_counts_value_stack() {
+        // Deep recursion where each frame keeps several locals live on the value
+        // stack. No string or GC-heap growth happens, so this trips ONLY because
+        // the per-run budget now counts the value stack. The old per-GC-heap guard
+        // missed this arena entirely and the program OOMed the kernel.
+        let src = "fn r(n){ let a=n; let b=n; let c=n; let d=n; let e=n; return r(a+b+c+d+e+1); } return r(0);";
+        let e = run_err(src, |vm| vm.set_byte_limit(64 * 1024));
+        assert!(e.contains("compute memory limit exceeded"), "got: {e}");
+    }
+
+    #[test]
+    fn stack_limit_alone_trips_deep_locals() {
+        // The explicit value-stack ceiling trips deep-locals recursion even with
+        // no total-byte budget set (defense in depth).
+        let src = "fn r(n){ let a=n; let b=n; let c=n; let d=n; return r(a+b+c+d+1); } return r(0);";
+        let e = run_err(src, |vm| vm.set_stack_limit(32 * 1024));
+        assert!(e.contains("compute memory limit exceeded"), "got: {e}");
+    }
+
+    #[test]
+    fn total_budget_counts_output() {
+        // With the output cap disabled but a total budget set, a print loop's
+        // output-string growth alone trips the budget cleanly. This arena was also
+        // previously uncounted.
+        let src = "let i=0; while(i<1000000){ print \"xxxxxxxxxxxxxxxx\"; i=i+1; } return 0;";
+        let e = run_err(src, |vm| {
+            vm.set_byte_limit(16 * 1024);
+            vm.set_step_limit(50_000_000);
+        });
+        assert!(e.contains("compute memory limit exceeded"), "got: {e}");
+    }
+
+    #[test]
+    fn output_limit_truncates_print_loop() {
+        // A print inside a loop grows the run output. With the output cap the run
+        // finishes cleanly and the output is truncated with a notice instead of
+        // growing without bound.
+        let src = "let i=0; while(i<100000){ print \"xxxxxxxx\"; i=i+1; } return 0;";
+        let out = run_output(src, |vm| {
+            vm.set_output_limit(4 * 1024);
+            vm.set_step_limit(50_000_000);
+        });
+        assert!(
+            out.len() <= 4 * 1024 + 128,
+            "output not capped: {} bytes",
+            out.len()
+        );
+        assert!(out.contains("output truncated"), "missing notice: {out}");
     }
 
     #[test]

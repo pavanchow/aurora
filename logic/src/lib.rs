@@ -66,7 +66,14 @@ pub fn run_kindling(src: &str) -> Result<(Outcome, String), String> {
     // the reference interpreter, so the kernel's compute resource caps (depth,
     // heap bytes) must not perturb it. The caps are exercised by their own unit
     // tests in the VM module.
-    let r = kindling::run_source_limited(src, u64::MAX, usize::MAX, usize::MAX)?;
+    let r = kindling::run_source_limited(
+        src,
+        u64::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )?;
     Ok((r.value, r.output))
 }
 
