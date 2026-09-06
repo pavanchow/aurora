@@ -154,6 +154,14 @@ shell_script() {
     printf 'vault get api-key\n'
     printf 'run hello\n'
     printf 'run sum 1000\n'
+    # Unbounded-work DoS gate: a native run task must never hang the single core on
+    # a huge argument. `run sum <u64::MAX>` used to spin forever in native EL1 code.
+    # It must now return promptly with the closed-form wrapping answer, and the
+    # shell must keep answering afterward. A malformed argument must error cleanly.
+    printf 'run sum 18446744073709551615\n'
+    printf 'run sum notanumber\n'
+    printf 'run sum 100\n'
+    printf 'compute 1000 + 7\n'
     printf 'vault list\n'
     # Parameterized compute: two different inputs -> two different outputs.
     printf 'compute 40 + 2\n'
@@ -388,6 +396,13 @@ require "kernel stack scrubbed"    "post-wipe kernel-stack scan: sentinel plaint
 # Compute: the embedded Kindling interpreter, gated by CAP_COMPUTE.
 require "compute runs in-session"  "of Kindling in-session (CAP_COMPUTE"
 require "parameterized run sum"    "sum(1..=1000) = 500500"
+# Unbounded-work DoS: `run sum <u64::MAX>` returns the closed-form wrapping answer
+# promptly instead of hanging the core, a malformed argument errors cleanly, the
+# normal small case is unchanged, and the shell keeps answering afterward.
+require "run sum huge returns"     "sum(1..=18446744073709551615) = 9223372036854775808"
+require "run sum malformed errors" "argument too large or invalid"
+require "run sum 100 still 5050"   "sum(1..=100) = 5050"
+require "shell alive after huge sum" "-> 1007"
 require "compute arg 40+2"         "-> 42"
 require "compute arg 6*7-1"        "-> 41"
 require "primes below 1000 sum"    "76127"

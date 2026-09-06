@@ -218,7 +218,16 @@ vault region. A `get` decrypts and verifies the tag before returning the value.
 
 `kernel/src/session.rs` defines an `AgentSession`, an ephemeral,
 capability-scoped unit of work. `session_start` creates one with a fresh session
-key. `run_task` runs an agent workload inside it. `msg_send` and `msg_recv` pass
+key. `run_task` runs a small named native workload inside it (`hello`, `sum`,
+`vault-demo`, `caps`). These arms run as native EL1 kernel code with no Kindling
+VM step limit, so their work is bounded by construction: `sum` uses the
+closed-form wrapping triangular sum `n*(n+1)/2` when the argument is large, so
+`run sum 18446744073709551615` returns the correct wrapping answer at once
+instead of spinning the single core, and no arm loops more than
+`NATIVE_TASK_WORK_LIMIT` times. A malformed argument returns a clean error rather
+than doing work. The shared bound and the closed form live in
+`kernel/src/native_task.rs`, host-tested through the `aurora-logic` crate.
+`msg_send` and `msg_recv` pass
 messages. `request_capability` grants a scoped capability to the session. On
 completion the session memory and its vault entries are wiped. The agent-oriented
 syscalls are `session_start`, `run_task`, `msg_send`, `msg_recv`,

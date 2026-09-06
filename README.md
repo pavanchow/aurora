@@ -194,7 +194,7 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `mem`               | heap bytes used/free, frame usage, durable writes   |
 | `echo <text>`       | print the text back                                 |
 | `session start`     | start a fresh agent session with a new key          |
-| `run <task> [arg]`  | run an agent workload, e.g. `run sum 1000`           |
+| `run <task> [arg]`  | run a bounded native workload, e.g. `run sum 1000` (a huge or malformed arg returns at once, never hangs) |
 | `compute <expr>`    | run a Kindling program (bare `compute` for multi-line, end with `.`) |
 | `vault put <k> <v>` | encrypt a secret into the in-RAM vault              |
 | `vault get <k>`     | decrypt and read a secret back                       |
