@@ -60,6 +60,11 @@ printf '%s\n' "$PAYLOAD" > "$WWW_DIR/collatz.txt"
 printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s\n' "$PAYLOAD" \
     > "$WWW_DIR/secure.txt"
 
+# Emit COUNT copies of a single character (used to build deeply nested programs).
+repeat_char() {
+    python3 -c "import sys; sys.stdout.write(sys.argv[1]*int(sys.argv[2]))" "$1" "$2"
+}
+
 free_port() {
     python3 - <<'PY'
 import socket
@@ -183,6 +188,21 @@ shell_script() {
     # Proof the shell survived both hostile programs: a normal compute still
     # answers with a distinctive result (123 + 456 = 579).
     printf 'compute 123 + 456\n'
+    # Parser recursion bound: a deeply nested program (20000 nested '(' then,
+    # separately, 20000 nested '!') must trip the parser nesting cap and return a
+    # clean compile error BEFORE the native kernel stack overflows into a data
+    # abort. Fed as multi-line compute programs so no single UART line is huge.
+    printf 'compute\n'
+    for _ in $(seq 1 40); do printf '%s\n' "$(repeat_char '(' 500)"; done
+    printf '1;\n'
+    printf '.\n'
+    printf 'compute\n'
+    for _ in $(seq 1 40); do printf '%s\n' "$(repeat_char '!' 500)"; done
+    printf 'true;\n'
+    printf '.\n'
+    # Proof the shell survived the deep-nesting programs: a distinctive result
+    # (111 + 222 = 333).
+    printf 'compute 111 + 222\n'
     # Amnesia of network buffers: fetch the local payload, take a fingerprint of
     # the REAL fetched bytes, wipe, then prove that exact fingerprint is gone from
     # the whole network scratch region. Deterministic against the local server.
@@ -282,6 +302,12 @@ require "recursion limit trips"    "[compute] error: recursion limit exceeded"
 require "heap limit trips"         "[compute] error: compute memory limit exceeded"
 require "shell alive after crash"  "-> 579"
 
+# Parser recursion bound: deeply nested '(' and '!' programs must be rejected with
+# a clean "nesting too deep" compile error (no data abort, no halt), and the shell
+# must still answer a normal command afterwards.
+require "deep nesting rejected"      "nesting too deep"
+require "shell alive after nesting"  "-> 333"
+
 # EL0 isolation: a user task makes a legit syscall, then faults trying to read
 # the vault directly, and the kernel recovers instead of halting.
 require "EL0 legit syscall works"  "EL0 user task ran a legit 'write' syscall"
@@ -379,6 +405,61 @@ if [ "$QEMU_RC" -ne 0 ]; then
 else
     green "  ok   QEMU exited 0"
 fi
+
+# --- Fault-path wipe gate -----------------------------------------------------
+# A deliberate fatal EL1 fault must scrub session RAM and prove the planted secret
+# is gone BEFORE it halts. This is a SEPARATE QEMU run because the fault handler
+# halts the machine (it never reaches `exit`), so this run does not shut down
+# cleanly and is expected to end on the watchdog timeout. Amnesia must hold even
+# on a crash.
+info "[fault-gate] separate QEMU run: a deliberate fatal EL1 fault must wipe before halt"
+FOUT="$(mktemp)"
+printf 'faulttest\n' | \
+    run_with_timeout 25 \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+        -kernel "$ELF" >"$FOUT" 2>&1
+echo "----------------------------------------------------------------"
+cat "$FOUT"
+echo "----------------------------------------------------------------"
+
+require_f() { # description, pattern (fixed-string)
+    if grep -qF -- "$2" "$FOUT"; then
+        green "  ok   $1"
+    else
+        red   "  MISS $1  (expected to find: $2)"
+        FAIL=1
+    fi
+}
+
+require_f "fault-gate raised a fatal fault"      "*** EXCEPTION"
+require_f "fault-gate planted a sentinel"        "[faulttest] sentinel present"
+require_f "fault-gate wiped on the fault"        "[wipe] scrubbed"
+require_f "fault-gate proved sentinel scrubbed"  "secret plaintext appears 0 times"
+require_f "fault-gate halted"                    "*** halted ***"
+
+# The planted sentinel must have been present pre-fault (not 0), else the proof is
+# vacuous.
+if grep -qF "sentinel present 0 time" "$FOUT"; then
+    red "  MISS fault-gate sentinel was not actually planted (present 0)"
+    FAIL=1
+else
+    green "  ok   fault-gate sentinel present pre-fault"
+fi
+
+# Ordering: the wipe line and the sentinel-zero proof must both appear BEFORE the
+# halt line, proving the scrub ran before the machine stopped.
+fw=$(grep -n "\[wipe\] scrubbed" "$FOUT" | head -1 | cut -d: -f1)
+fz=$(grep -n "appears 0 times" "$FOUT" | head -1 | cut -d: -f1)
+fh=$(grep -n "\*\*\* halted" "$FOUT" | head -1 | cut -d: -f1)
+if [ -n "$fw" ] && [ -n "$fz" ] && [ -n "$fh" ] && [ "$fw" -lt "$fh" ] && [ "$fz" -lt "$fh" ]; then
+    green "  ok   fault-gate wiped and proved zero before halting (wipe=$fw zero=$fz halt=$fh)"
+else
+    red   "  MISS fault-gate did not wipe+prove before halt (wipe=$fw zero=$fz halt=$fh)"
+    FAIL=1
+fi
+rm -f "$FOUT"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
