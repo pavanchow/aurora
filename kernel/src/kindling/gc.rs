@@ -41,6 +41,17 @@ impl Obj {
             }
         }
     }
+
+    /// Approximate live-memory footprint of this object in bytes, used to enforce
+    /// the compute heap ceiling. A small fixed overhead accounts for the slot
+    /// bookkeeping, on top of the variable payload (string bytes, captured slots).
+    fn footprint(&self) -> usize {
+        const OVERHEAD: usize = 24;
+        match self {
+            Obj::Str(s) => OVERHEAD + s.len(),
+            Obj::Closure(c) => OVERHEAD + c.upvalues.len() * core::mem::size_of::<Value>(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -51,6 +62,7 @@ pub struct Heap {
     since_gc: usize,
     pub next_gc: usize,
     pub stress: bool,
+    bytes: usize,
 }
 
 impl Heap {
@@ -62,11 +74,20 @@ impl Heap {
             since_gc: 0,
             next_gc: 128,
             stress: false,
+            bytes: 0,
         }
+    }
+
+    /// Live heap footprint in bytes: the sum of every currently allocated
+    /// object's `footprint`. Decremented as the sweep frees objects, so it
+    /// tracks the memory a compute run actually holds, not a running total.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     pub fn alloc(&mut self, obj: Obj) -> GcRef {
         self.since_gc += 1;
+        self.bytes += obj.footprint();
         if let Some(i) = self.free.pop() {
             self.slots[i] = Some(obj);
             self.marks[i] = false;
@@ -129,6 +150,9 @@ impl Heap {
         let mut freed = 0;
         for i in 0..self.slots.len() {
             if self.slots[i].is_some() && !self.marks[i] {
+                if let Some(obj) = &self.slots[i] {
+                    self.bytes = self.bytes.saturating_sub(obj.footprint());
+                }
                 self.slots[i] = None;
                 self.free.push(i);
                 freed += 1;

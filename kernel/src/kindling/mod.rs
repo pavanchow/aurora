@@ -44,12 +44,37 @@ pub fn compile_source(src: &str) -> Result<Program, String> {
     compiler::compile(&ast)
 }
 
+/// Default call-frame depth cap for an in-OS compute run. Unbounded recursion
+/// hits this and returns a clean runtime error instead of exhausting the kernel
+/// stack/heap and panicking.
+pub const COMPUTE_DEPTH_LIMIT: usize = 1024;
+
+/// Default live-heap ceiling (bytes) for a single in-OS compute run. A program
+/// that builds an ever-growing value trips this and fails cleanly instead of
+/// OOMing the 4 MiB global kernel allocator. Kept well below the heap size so
+/// even the transient of the allocation that crosses the line stays safe.
+pub const COMPUTE_HEAP_LIMIT: usize = 256 * 1024;
+
 /// Compile and run source on the bytecode VM, bounding total executed
 /// instructions so a runaway program cannot hang the single-core kernel.
 pub fn run_source(src: &str, step_limit: u64) -> Result<RunResult, String> {
+    run_source_limited(src, step_limit, COMPUTE_DEPTH_LIMIT, COMPUTE_HEAP_LIMIT)
+}
+
+/// Compile and run source with explicit resource limits. Any of the three limits
+/// (instructions, call depth, live heap bytes) trips a clean `Err` rather than a
+/// kernel panic or OOM, so a hostile agent program cannot take down the OS.
+pub fn run_source_limited(
+    src: &str,
+    step_limit: u64,
+    depth_limit: usize,
+    byte_limit: usize,
+) -> Result<RunResult, String> {
     let program = compile_source(src)?;
     let mut machine = vm::Vm::new();
     machine.set_step_limit(step_limit);
+    machine.set_depth_limit(depth_limit);
+    machine.set_byte_limit(byte_limit);
     let value = machine.interpret(&program)?;
     Ok(RunResult {
         value: machine.to_outcome(value),

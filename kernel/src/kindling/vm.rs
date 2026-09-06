@@ -35,6 +35,13 @@ pub struct Vm {
     /// the single-core kernel. None disables the cap (host tests).
     step_limit: Option<u64>,
     steps: u64,
+    /// Cap on the call-frame depth so unbounded recursion returns a clean runtime
+    /// error instead of exhausting memory and panicking the kernel. None disables.
+    depth_limit: Option<usize>,
+    /// Ceiling on live interpreter-heap bytes for a single run, so a program that
+    /// builds an ever-growing value fails cleanly instead of OOMing the global
+    /// kernel allocator. None disables the cap (host tests).
+    byte_limit: Option<usize>,
 }
 
 impl Default for Vm {
@@ -54,6 +61,8 @@ impl Vm {
             auto_gc: true,
             step_limit: None,
             steps: 0,
+            depth_limit: None,
+            byte_limit: None,
         }
     }
 
@@ -69,6 +78,17 @@ impl Vm {
     /// Bound total executed instructions (kernel safety valve).
     pub fn set_step_limit(&mut self, limit: u64) {
         self.step_limit = Some(limit);
+    }
+
+    /// Bound the call-frame depth (kernel safety valve for runaway recursion).
+    pub fn set_depth_limit(&mut self, limit: usize) {
+        self.depth_limit = Some(limit);
+    }
+
+    /// Bound live interpreter-heap bytes for the run (kernel safety valve for
+    /// runaway allocation).
+    pub fn set_byte_limit(&mut self, limit: usize) {
+        self.byte_limit = Some(limit);
     }
 
     pub fn take_output(&mut self) -> String {
@@ -144,6 +164,11 @@ impl Vm {
                 }
             }
             self.maybe_gc();
+            if let Some(limit) = self.byte_limit {
+                if self.heap.bytes() > limit {
+                    return Err("compute memory limit exceeded".into());
+                }
+            }
             let frame = self.frames.len() - 1;
             let op = self.read_byte(program, frame);
             match op {
@@ -345,6 +370,11 @@ impl Vm {
             Obj::Closure(c) => c.func,
             _ => return Err("can only call functions".into()),
         };
+        if let Some(limit) = self.depth_limit {
+            if self.frames.len() >= limit {
+                return Err("recursion limit exceeded".into());
+            }
+        }
         let slot_base = self.stack.len() - argc - 1;
         self.frames.push(Frame {
             closure: r,
@@ -548,6 +578,51 @@ mod tests {
         let mut vm = Vm::new();
         let v = vm.interpret(&program).unwrap();
         vm.to_outcome(v)
+    }
+
+    fn run_err(src: &str, configure: impl FnOnce(&mut Vm)) -> String {
+        let program = compile(&parse(tokenize(src).unwrap()).unwrap()).unwrap();
+        let mut vm = Vm::new();
+        configure(&mut vm);
+        vm.interpret(&program).unwrap_err()
+    }
+
+    #[test]
+    fn depth_limit_stops_unbounded_recursion() {
+        let src = "fn r(n){ return r(n+1); } return r(0);";
+        let e = run_err(src, |vm| vm.set_depth_limit(512));
+        assert!(e.contains("recursion limit exceeded"), "got: {e}");
+    }
+
+    #[test]
+    fn depth_limit_allows_legit_recursion() {
+        // fib(10) recurses far deeper than one frame but nowhere near 512.
+        let program =
+            compile(&parse(tokenize("fn fib(n){ if(n<2){return n;} return fib(n-1)+fib(n-2); } return fib(10);").unwrap()).unwrap())
+                .unwrap();
+        let mut vm = Vm::new();
+        vm.set_depth_limit(512);
+        let v = vm.interpret(&program).unwrap();
+        assert_eq!(vm.to_outcome(v), Outcome::Int(55));
+    }
+
+    #[test]
+    fn byte_limit_stops_unbounded_allocation() {
+        // Doubling a string blows past any fixed ceiling in a few iterations.
+        let src = "let s=\"x\"; let i=0; while(i<10000){ s=s+s; i=i+1; } return s;";
+        let e = run_err(src, |vm| vm.set_byte_limit(64 * 1024));
+        assert!(e.contains("compute memory limit exceeded"), "got: {e}");
+    }
+
+    #[test]
+    fn byte_limit_allows_modest_allocation() {
+        let program =
+            compile(&parse(tokenize("let s=\"\"; let i=0; while(i<50){ s=s+\"ab\"; i=i+1; } return s;").unwrap()).unwrap())
+                .unwrap();
+        let mut vm = Vm::new();
+        vm.set_byte_limit(512 * 1024);
+        let v = vm.interpret(&program).unwrap();
+        assert!(matches!(vm.to_outcome(v), Outcome::Str(_)));
     }
 
     #[test]
