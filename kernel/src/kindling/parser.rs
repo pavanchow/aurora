@@ -8,34 +8,58 @@ use alloc::vec::Vec;
 use super::ast::{BinOp, Expr, FnDecl, Stmt, UnOp};
 use super::lexer::{Tok, Token};
 
-/// Maximum expression/grouping/unary nesting the parser will descend into before
-/// aborting with a clean error. Each nesting level costs a fixed handful of native
-/// stack frames in this recursive-descent parser, so the cap is set with a large
-/// margin below the depth at which the kernel stack was observed to overflow (a
-/// raw EL1 data abort started around 4000 levels). At 256 the deepest chain uses a
-/// few hundred native frames, well inside the 1 MiB kernel stack.
-pub const MAX_NESTING_DEPTH: usize = 256;
+/// Maximum recursive-descent nesting the parser will enter before aborting with a
+/// clean error. The bound is UNIFORM: every recursive production bumps a single
+/// shared counter on entry (via a scope guard) and the counter is checked against
+/// this one cap, so no production can be forgotten and no input shape can drive
+/// the native kernel stack past a fixed depth. The counter measures native parser
+/// frames directly, so at 512 the deepest chain uses a few hundred small frames,
+/// well inside the 1 MiB kernel stack (a raw EL1 data abort was observed only in
+/// the thousands of native frames).
+pub const MAX_NESTING_DEPTH: usize = 512;
+
+/// Ceiling on the number of AST nodes a single program may build. Enforced as the
+/// tree is constructed so a large but shallow program (which the depth bound alone
+/// would not stop) returns a clean `program too large` error instead of exhausting
+/// the kernel heap.
+pub const MAX_AST_NODES: usize = 100_000;
 
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
     depth: usize,
+    nodes: usize,
 }
 
 type PResult<T> = Result<T, String>;
 
+/// RAII scope guard for the shared nesting counter. Constructing it (through
+/// `Parser::enter`) has already incremented the counter; dropping it decrements
+/// it again, on every exit path including the `?` early return. It holds a raw
+/// pointer rather than a borrow so a guarded method can still call `&mut self`
+/// productions while the guard is live; the `Parser` never moves during a parse,
+/// so the pointer stays valid for the guard's lifetime.
+struct DepthGuard {
+    depth: *mut usize,
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        unsafe { *self.depth -= 1 };
+    }
+}
+
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, depth: 0 }
+        Parser { toks, pos: 0, depth: 0, nodes: 0 }
     }
 
-    /// Enter one level of recursive expression nesting. Returns a clean error when
-    /// the cap is reached so the caller aborts parsing instead of overflowing the
-    /// native stack. Every `enter_nesting` that returns `Ok` must be paired with a
-    /// `leave_nesting` on the success path so sibling expressions do not inherit
-    /// each other's depth.
-    fn enter_nesting(&mut self) -> PResult<()> {
+    /// Enter one level of recursive nesting. Returns a guard that unwinds the
+    /// counter on drop, or a clean error once the cap is reached so the caller
+    /// aborts parsing instead of overflowing the native stack.
+    fn enter(&mut self) -> PResult<DepthGuard> {
         self.depth += 1;
+        let guard = DepthGuard { depth: core::ptr::addr_of_mut!(self.depth) };
         if self.depth > MAX_NESTING_DEPTH {
             return Err(format!(
                 "line {}: nesting too deep (limit {})",
@@ -43,11 +67,20 @@ impl Parser {
                 MAX_NESTING_DEPTH
             ));
         }
-        Ok(())
+        Ok(guard)
     }
 
-    fn leave_nesting(&mut self) {
-        self.depth -= 1;
+    /// Account for one freshly built AST node, aborting cleanly once the program
+    /// exceeds the node budget so an oversized program cannot OOM the kernel heap.
+    fn node(&mut self) -> PResult<()> {
+        self.nodes += 1;
+        if self.nodes > MAX_AST_NODES {
+            return Err(format!(
+                "program too large (over {} AST nodes)",
+                MAX_AST_NODES
+            ));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Tok {
@@ -102,6 +135,8 @@ impl Parser {
     }
 
     fn statement(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
+        self.node()?;
         match self.peek() {
             Tok::Let => self.let_stmt(),
             Tok::Fn => self.fn_decl(),
@@ -118,6 +153,7 @@ impl Parser {
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         let name = self.ident("variable name")?;
         self.expect(&Tok::Eq, "'=' in let")?;
@@ -127,6 +163,7 @@ impl Parser {
     }
 
     fn fn_decl(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         let name = self.ident("function name")?;
         self.expect(&Tok::LParen, "'(' after function name")?;
@@ -145,6 +182,7 @@ impl Parser {
     }
 
     fn if_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         self.expect(&Tok::LParen, "'(' after if")?;
         let cond = self.expression()?;
@@ -163,6 +201,7 @@ impl Parser {
     }
 
     fn while_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         self.expect(&Tok::LParen, "'(' after while")?;
         let cond = self.expression()?;
@@ -172,6 +211,7 @@ impl Parser {
     }
 
     fn return_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         if self.matches(&Tok::Semicolon) {
             return Ok(Stmt::Return(None));
@@ -182,6 +222,7 @@ impl Parser {
     }
 
     fn print_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         self.advance();
         let value = self.expression()?;
         self.expect(&Tok::Semicolon, "';' after print value")?;
@@ -189,12 +230,14 @@ impl Parser {
     }
 
     fn expr_stmt(&mut self) -> PResult<Stmt> {
+        let _g = self.enter()?;
         let e = self.expression()?;
         self.expect(&Tok::Semicolon, "';' after expression")?;
         Ok(Stmt::ExprStmt(e))
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
+        let _g = self.enter()?;
         self.expect(&Tok::LBrace, "'{'")?;
         let mut stmts = Vec::new();
         while !self.check(&Tok::RBrace) && !self.check(&Tok::Eof) {
@@ -217,18 +260,18 @@ impl Parser {
     }
 
     fn expression(&mut self) -> PResult<Expr> {
-        self.enter_nesting()?;
-        let r = self.assignment();
-        self.leave_nesting();
-        r
+        let _g = self.enter()?;
+        self.assignment()
     }
 
     fn assignment(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
         let left = self.equality()?;
         if self.check(&Tok::Eq) {
             self.advance();
             let value = self.assignment()?;
             if let Expr::Var(name) = left {
+                self.node()?;
                 return Ok(Expr::Assign(name, Box::new(value)));
             }
             return Err(format!("line {}: invalid assignment target", self.line()));
@@ -237,6 +280,12 @@ impl Parser {
     }
 
     fn equality(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
+        // Each operator deepens the left-nested tree by one, so bound the chain
+        // with the same depth budget: the guards accumulate for the whole chain
+        // and unwind when the method returns. This keeps a long `a==b==c==...`
+        // chain from building a tree too deep to compile or drop without overflow.
+        let mut ops: Vec<DepthGuard> = Vec::new();
         let mut left = self.comparison()?;
         loop {
             let op = match self.peek() {
@@ -245,13 +294,17 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            ops.push(self.enter()?);
             let right = self.comparison()?;
+            self.node()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     fn comparison(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
+        let mut ops: Vec<DepthGuard> = Vec::new();
         let mut left = self.term()?;
         loop {
             let op = match self.peek() {
@@ -262,13 +315,17 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            ops.push(self.enter()?);
             let right = self.term()?;
+            self.node()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     fn term(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
+        let mut ops: Vec<DepthGuard> = Vec::new();
         let mut left = self.factor()?;
         loop {
             let op = match self.peek() {
@@ -277,13 +334,17 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            ops.push(self.enter()?);
             let right = self.factor()?;
+            self.node()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     fn factor(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
+        let mut ops: Vec<DepthGuard> = Vec::new();
         let mut left = self.unary()?;
         loop {
             let op = match self.peek() {
@@ -293,13 +354,16 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            ops.push(self.enter()?);
             let right = self.unary()?;
+            self.node()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     fn unary(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
         let op = match self.peek() {
             Tok::Minus => Some(UnOp::Neg),
             Tok::Bang => Some(UnOp::Not),
@@ -307,17 +371,15 @@ impl Parser {
         };
         if let Some(op) = op {
             self.advance();
-            // A prefix `!`/`-` chain recurses directly into `unary` without going
-            // through `expression`, so it needs its own nesting bound.
-            self.enter_nesting()?;
-            let operand = self.unary();
-            self.leave_nesting();
-            return Ok(Expr::Unary(op, Box::new(operand?)));
+            let operand = self.unary()?;
+            self.node()?;
+            return Ok(Expr::Unary(op, Box::new(operand)));
         }
         self.call()
     }
 
     fn call(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
         let mut expr = self.primary()?;
         loop {
             if self.matches(&Tok::LParen) {
@@ -331,6 +393,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen, "')' after arguments")?;
+                self.node()?;
                 expr = Expr::Call(Box::new(expr), args);
             } else {
                 break;
@@ -340,6 +403,8 @@ impl Parser {
     }
 
     fn primary(&mut self) -> PResult<Expr> {
+        let _g = self.enter()?;
+        self.node()?;
         let line = self.line();
         match self.advance() {
             Tok::Int(n) => Ok(Expr::Int(n)),
@@ -401,10 +466,104 @@ mod tests {
     }
 
     #[test]
+    fn deep_assignment_chain_errors_cleanly() {
+        // `a = a = a = ... = 1;` recurses through `assignment` per `=`; the shared
+        // bound must stop it instead of overflowing the native stack.
+        let mut src = String::new();
+        for _ in 0..20_000 {
+            src.push_str("a = ");
+        }
+        src.push_str("1;");
+        let err = parse_src(&src).expect_err("deep assignment must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn deep_block_nesting_errors_cleanly() {
+        let n = 20_000;
+        let mut src = String::new();
+        for _ in 0..n {
+            src.push('{');
+        }
+        for _ in 0..n {
+            src.push('}');
+        }
+        let err = parse_src(&src).expect_err("deep blocks must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn deep_if_nesting_errors_cleanly() {
+        let mut src = String::new();
+        for _ in 0..20_000 {
+            src.push_str("if(1){");
+        }
+        for _ in 0..20_000 {
+            src.push('}');
+        }
+        let err = parse_src(&src).expect_err("deep if must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn deep_while_nesting_errors_cleanly() {
+        let mut src = String::new();
+        for _ in 0..20_000 {
+            src.push_str("while(1){");
+        }
+        for _ in 0..20_000 {
+            src.push('}');
+        }
+        let err = parse_src(&src).expect_err("deep while must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn deep_call_chain_errors_cleanly() {
+        let mut src = String::new();
+        for _ in 0..20_000 {
+            src.push_str("f(");
+        }
+        src.push('1');
+        for _ in 0..20_000 {
+            src.push(')');
+        }
+        src.push(';');
+        let err = parse_src(&src).expect_err("deep call chain must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn long_binary_chain_errors_cleanly() {
+        // A long operator chain deepens the left-nested tree, so the shared depth
+        // budget must reject it before a tree too deep to compile or drop is built.
+        let mut src = String::from("1");
+        for _ in 0..20_000 {
+            src.push_str("+1");
+        }
+        src.push(';');
+        let err = parse_src(&src).expect_err("long binary chain must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn oversized_shallow_program_hits_node_budget() {
+        // A wide, shallow program (many independent statements) stays under the
+        // depth bound but must trip the AST node budget so it cannot OOM the heap.
+        let mut src = String::new();
+        for _ in 0..(MAX_AST_NODES) {
+            src.push_str("1;");
+        }
+        let err = parse_src(&src).expect_err("oversized program must be rejected");
+        assert!(err.contains("program too large"), "got: {err}");
+    }
+
+    #[test]
     fn nesting_just_below_the_cap_still_parses() {
-        // A grouping chain a little under the cap must remain valid: the counter
-        // is per-expression and unwinds, so depth does not leak across siblings.
-        let depth = MAX_NESTING_DEPTH - 8;
+        // A grouping chain a little under the cap must remain valid: the counter is
+        // per-nesting and unwinds, so depth does not leak across siblings. Each
+        // paren descends the full expression chain, so stay well under the cap.
+        let depth = MAX_NESTING_DEPTH / 16;
         let mut src = String::new();
         for _ in 0..depth {
             src.push('(');
@@ -428,5 +587,16 @@ mod tests {
             src.push_str(" = (((1)));\n");
         }
         assert!(parse_src(&src).is_ok(), "shallow siblings must all parse");
+    }
+
+    #[test]
+    fn realistic_nested_control_flow_parses() {
+        // The kind of nesting a real program uses (a handful of levels) must be
+        // comfortably under the bound.
+        let src = "\
+            fn f(n){ if(n<2){ return 1; } let s=0; let i=0; \
+            while(i<n){ if(i%2==0){ s=s+i; } else { s=s+1; } i=i+1; } return s; } \
+            print f(10);";
+        assert!(parse_src(src).is_ok(), "realistic nesting should parse");
     }
 }
