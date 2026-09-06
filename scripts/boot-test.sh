@@ -215,6 +215,20 @@ shell_script() {
     printf 'let i=0; while(i<200000){ print "spam"; i=i+1; } print "loopdone";\n'
     printf '.\n'
     printf 'compute 800 + 88\n'
+    # Call-arity check: calling a function with the wrong number of arguments must
+    # return a clean Kindling runtime error, never panic the VM with an out-of-
+    # bounds value-stack read (too few args) and never silently read a stale slot
+    # for a missing argument (an info leak). A distinctive normal compute answers
+    # after each, proving the shell stayed alive.
+    # Too few args: used to index past the value stack and halt the kernel.
+    printf 'compute fn f(a){return a;} return f();\n'
+    printf 'compute 909 + 90\n'
+    # Missing one arg: used to return 18 by reading a stale slot for the missing b.
+    printf 'compute fn f(a,b){return a+b;} return f(9);\n'
+    printf 'compute 900 + 19\n'
+    # Too many args: exact-match arity means over-supply is a consistent error too.
+    printf 'compute fn g(){return 42;} return g(1,2,3);\n'
+    printf 'compute 800 + 41\n'
     # Parser recursion bound: a deeply nested program (20000 nested '(' then,
     # separately, 20000 nested '!') must trip the parser nesting cap and return a
     # clean compile error BEFORE the native kernel stack overflows into a data
@@ -396,6 +410,17 @@ require "shell alive after locals"   "-> 777"
 require "output cap truncates loop"  "output truncated"
 require "shell alive after prints"   "-> 888"
 
+# Call-arity check: wrong argument counts return a clean runtime error instead of
+# panicking the VM (too few args) or silently reading a stale slot (missing arg).
+# A distinctive normal compute answers after each, proving the shell stayed alive.
+require "too-few-args clean error"   "[compute] error: wrong number of arguments (expected 1, got 0)"
+require "shell alive after too-few"  "-> 999"
+require "missing-arg clean error"    "[compute] error: wrong number of arguments (expected 2, got 1)"
+refute "missing arg does not leak"   "-> 18"
+require "shell alive after missing"  "-> 919"
+require "too-many-args clean error"  "[compute] error: wrong number of arguments (expected 0, got 3)"
+require "shell alive after too-many" "-> 841"
+
 # Parser recursion bound: deeply nested '(' and '!' programs must be rejected with
 # a clean "nesting too deep" compile error (no data abort, no halt), and the shell
 # must still answer a normal command afterwards.
@@ -493,6 +518,7 @@ refute "no panic"                "\[panic\]"
 refute "no alloc-error handler"  "handle_alloc_error"
 refute "no alloc failure"        "memory allocation of [0-9]+ bytes failed"
 refute "no halt on compute"      "\*\*\* halted \*\*\*"
+refute "no OOB value-stack read" "index out of bounds"
 refute "amnesia did not fail"    "\[amnesia\] FAIL"
 refute "netamnesia did not fail" "\[netamnesia\] FAIL"
 

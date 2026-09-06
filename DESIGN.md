@@ -247,6 +247,22 @@ loop cannot hang the single core. A call-depth limit (1024 frames) turns unbound
 recursion into a "recursion limit exceeded" error instead of exhausting the stack
 and heap.
 
+Calls are also checked for arity. A call sets up the callee frame with its base
+pointing argc slots below the callee on the value stack, so a wrong argument count
+used to be a live hazard: too few arguments made a later local read reach past the
+top of the value stack and panic-halt the kernel, and a missing argument silently
+read whatever stale value happened to sit in that slot, a nondeterministic result
+and an information leak. The compiler already records each function's declared
+parameter count, so the fix is to read it: before a call establishes its frame the
+VM compares argc against the callee's arity and, on any mismatch, returns a clean
+"wrong number of arguments (expected N, got M)" runtime error that the shell
+reports before scrubbing the scratch. The language has no variadics, so an exact
+match is required, over or under. The tree-walking reference interpreter enforces
+the identical rule with the identical message, so the differential test still
+agrees, and the fuzzer now mutates call-site argument counts against callee arity
+(too few, exact, too many) so both evaluators are checked to agree on the match and
+on the error.
+
 The memory ceiling is a single TOTAL per-run budget, not a per-arena one. An
 earlier version measured only the GC object heap, so a program could still OOM
 the kernel by growing an allocation that lives outside that arena: deep recursion

@@ -225,7 +225,11 @@ returns a clean limit error (`recursion limit exceeded`, `compute memory limit
 exceeded`) or a truncated-output notice instead of crashing the kernel, and the
 shell keeps accepting commands. The memory limit is a single total budget across
 every growable arena checked before each instruction, so it trips well before the
-kernel heap is exhausted.
+kernel heap is exhausted. Calling a function with the wrong number of arguments is
+caught the same way: an exact match is required (no variadics), and any mismatch
+returns a clean `wrong number of arguments (expected N, got M)` error rather than
+reading past the value stack (which used to halt the kernel) or reading a stale
+slot for a missing argument (a silent, leaky, nondeterministic result).
 
 ## Test
 
