@@ -870,6 +870,98 @@ else
 fi
 rm -f "$NOUT"
 
+# --- Shell-history flood gate -------------------------------------------------
+# The interactive shell keeps an up/down-arrow command history. It used to be an
+# uncapped Vec<String>: every distinct line was pushed forever, so feeding tens
+# of thousands of distinct long command lines grew the Vec (and the strings it
+# held) until the 4 MiB kernel heap was exhausted and the kernel panic-halted
+# (the failing alloc was the history Vec doubling to 32768 * sizeof(String)).
+# History is now a bounded ring (last K lines, each length-capped), so the memory
+# it holds is a small constant. This SEPARATE QEMU run floods the shell with
+# 30000 distinct ~200-char lines (well past the ~16k that used to OOM), then
+# proves the kernel did NOT panic/OOM/halt, the heap stayed small, and the shell
+# still answers a normal command afterward. A regression OOMs and the run either
+# panics or is killed by the watchdog (rc 124).
+info "[history-gate] separate QEMU run: a flood of 30000 distinct long command lines must not OOM the history ring"
+HOUT="$(mktemp)"
+HSTART=$(date +%s)
+{
+    printf 'mem\n'
+    # 30000 distinct ~200-char lines: a unique index prefix plus filler. Each is
+    # remembered, so before the cap this grew the history Vec without bound.
+    python3 -c "
+import sys
+for i in range(30000):
+    sys.stdout.write('zzhist%08d' % i + 'q'*190 + '\n')
+"
+    # Prove the shell survived the flood with a no-capability command, then a
+    # fresh session + a distinctive compute (2 + 2 -> 4), then read the heap again.
+    printf 'echo HISTORY-FLOOD-SURVIVED-Zx9Q\n'
+    printf 'session start\n'
+    printf 'compute 2 + 2\n'
+    printf 'mem\n'
+    printf 'exit\n'
+} | run_with_timeout 180 \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+        -kernel "$ELF" >"$HOUT" 2>&1
+HIST_RC=$?
+HEND=$(date +%s)
+# Keep only the tail: the flood reflects 30000 "unknown command" lines, but the
+# gate only cares about the post-flood markers, so trim to keep the log readable.
+echo "----------------------------------------------------------------"
+tail -n 40 "$HOUT"
+echo "----------------------------------------------------------------"
+info "[history-gate] elapsed $((HEND-HSTART))s (an unbounded history would OOM before finishing)"
+
+require_h() { # description, pattern (fixed-string)
+    if grep -qF -- "$2" "$HOUT"; then
+        green "  ok   $1"
+    else
+        red   "  MISS $1  (expected to find: $2)"
+        FAIL=1
+    fi
+}
+refute_h() { # description, pattern (regex)
+    if grep -qE "$2" "$HOUT"; then
+        red   "  BAD  $1  (unexpected: $2)"
+        FAIL=1
+    else
+        green "  ok   $1"
+    fi
+}
+
+require_h "history-gate shell alive after flood" "HISTORY-FLOOD-SURVIVED-Zx9Q"
+require_h "history-gate compute answers post-flood" "-> 4"
+require_h "history-gate clean shutdown"           "[shutdown] powering off"
+refute_h  "history-gate no panic"                 "\[panic\]"
+refute_h  "history-gate no alloc-error handler"   "handle_alloc_error"
+refute_h  "history-gate no alloc failure"         "memory allocation of [0-9]+ bytes failed"
+refute_h  "history-gate no halt"                  "\*\*\* halted \*\*\*"
+refute_h  "history-gate no CPU exception"         "\*\*\* EXCEPTION"
+
+# Heap stays bounded: parse the LAST "heap:" line (measured after the flood) and
+# assert used bytes stayed well under 2 MiB. Before the fix, history alone drove
+# usage past the whole 4 MiB heap and the kernel died.
+HEAP_USED=$(grep -F "heap:" "$HOUT" | tail -1 | sed -E 's/.*heap:[[:space:]]*([0-9]+) \/.*/\1/')
+if [ -n "$HEAP_USED" ] && [ "$HEAP_USED" -lt 2097152 ]; then
+    green "  ok   history-gate heap bounded after flood (${HEAP_USED} bytes used, < 2 MiB)"
+else
+    red   "  MISS history-gate heap not bounded after flood (used='${HEAP_USED}')"
+    FAIL=1
+fi
+
+# A prompt clean exit (rc 0) proves the flood neither OOM-halted nor hung: a
+# regression panics on the failing history allocation or is killed with rc 124.
+if [ "$HIST_RC" -ne 0 ]; then
+    red   "  MISS history-gate QEMU did not exit cleanly (rc=$HIST_RC; 124 means it hung, other means it died)"
+    FAIL=1
+else
+    green "  ok   history-gate QEMU exited 0 (flood did not OOM or hang the kernel)"
+fi
+rm -f "$HOUT"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     green "BOOT TEST PASSED"
