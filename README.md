@@ -65,8 +65,21 @@ throwaway compute.
   prints the body. The capability is off by default and revocable, so the
   trace-free posture holds unless a session asks for the network. Every network
   buffer, including the fetched body, lives in a reserved region the wipe scrubs,
-  so pulled bytes do not survive a teardown. Limits: one connection at a time,
-  HTTP/1.0 only (no TLS or HTTPS yet), and polled with no congestion control.
+  so pulled bytes do not survive a teardown.
+- Speaks TLS 1.3 over the wire, from scratch. `fetch https://host/path` runs a
+  from-scratch TLS 1.3 client (RFC 8446) on TCP 443, then the existing HTTP/1.0
+  request over the encrypted channel. The cipher suite is
+  TLS_CHACHA20_POLY1305_SHA256, so it reuses the in-tree ChaCha20-Poly1305 AEAD,
+  with x25519 key exchange, an HKDF-over-HMAC-SHA256 key schedule, and SHA-256 for
+  the transcript, all written from scratch. It parses the server certificate chain
+  (ASN.1 DER) and verifies the server CertificateVerify signature against the leaf
+  public key with a from-scratch Ed25519 verifier, then checks the SNI host
+  against the certificate name, reaching an authenticated-to-leaf channel. Full
+  root-CA chain anchoring, revocation, and wall-clock date enforcement are not yet
+  done and are stated as such. The x25519 private key, every TLS traffic key, and
+  the decrypted response plaintext all live in the wiped network region, so a wipe
+  scrubs them. Limits: one connection at a time, HTTP/1.0 over TLS, polled with no
+  congestion control, and no TLS 1.2 fallback.
 - Tears down without a trace. On session or task exit that session's memory and
   vault are scrubbed, no shell history is retained, and caches are flushed. A full
   session runs and then leaves RAM clean.
@@ -139,7 +152,8 @@ qemu-system-aarch64 -M virt -cpu max -m 512 -nographic -semihosting \
 
 The `-cpu max` gives the guest the ARMv8.5 hardware RNG, and the virtio-net
 device provides the optional network channel. `cargo run --release` uses the same
-flags through the cargo runner.
+flags through the cargo runner. For a real HTTPS target the same command works,
+for example `fetch https://example.com/` after `session start` and `cap net`.
 
 The kernel boots, runs its startup demo (allocators, timer, two interleaving
 tasks, a syscall round-trip, a vault put and get), then drops you at the
@@ -164,9 +178,10 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `cap net`           | grant the revocable network capability              |
 | `cap revoke net`    | revoke the network capability                       |
 | `net <msg>`         | ICMP echo round-trip over the network (needs CAP_NET) |
-| `fetch <url>`       | HTTP/1.0 GET `http://host[:port]/path`, print the body (needs CAP_NET) |
+| `fetch [-k] <url>`  | GET `http://` or TLS 1.3 `https://` `host[:port]/path`, print the body (needs CAP_NET); `-k` is the insecure/pinned self-test mode |
+| `tlsinfo [-k] <host>` | TLS 1.3 handshake, print negotiated group, cipher suite, cert subject, and validation level (needs CAP_NET) |
 | `resolve <name> [ns]` | live DNS A-record lookup (needs CAP_NET)          |
-| `netamnesia <url>`  | fetch a payload, wipe, prove the bytes are gone     |
+| `netamnesia [-k] <url>` | fetch a payload (http or https), wipe, prove the bytes (incl. decrypted TLS plaintext) are gone |
 | `el0test`           | run an EL0 user task that must fault on kernel RAM   |
 | `wipe`              | scrub the key, vault, frames, network buffers, and free stack to zero |
 | `panic`             | trigger a panic, which wipes before halting          |
@@ -192,11 +207,22 @@ the amnesia proof that the sentinel is gone after the wipe:
 ./scripts/boot-test.sh
 ```
 
+The boot test also stands up a local TLS 1.3 server (OpenSSL `s_server` with a
+self-signed Ed25519 leaf, ChaCha20 only) and asserts that Aurora completes a real
+TLS 1.3 handshake against it, verifies the ed25519 CertificateVerify against the
+leaf key, reaches authenticated-to-leaf, and returns the exact known payload over
+the encrypted channel. A best-effort `fetch https://example.com/` over the real
+internet is printed but never hard-fails when offline.
+
 Host unit tests for the pure logic that can be checked without hardware, including
-the ChaCha20 and Poly1305 known-answer vectors, the frame allocator, the heap
-allocator invariants, the page-table index math, and the scheduler run-queue
-policy. These modules are the exact source the kernel compiles, pulled into a host
-crate so `cargo test` exercises the same code:
+the ChaCha20 and Poly1305 known-answer vectors, the from-scratch TLS 1.3 crypto
+checked against the published RFC test vectors (the RFC 8448 TLS 1.3 key-schedule
+trace, RFC 7748 x25519, RFC 5869 HKDF, RFC 8032 Ed25519, RFC 4231 HMAC-SHA256, and
+the NIST SHA-256/SHA-512 vectors), plus the X.509 parser against real OpenSSL
+certificates, the frame allocator, the heap allocator invariants, the page-table
+index math, and the scheduler run-queue policy. These modules are the exact source
+the kernel compiles, pulled into a host crate so `cargo test` exercises the same
+code:
 
 ```sh
 cargo test --workspace
@@ -208,8 +234,13 @@ cargo test --workspace
 kernel/     the real no_std aarch64 kernel (boot, MMU, GIC, timer, scheduler, syscalls, vault, wipe, shell)
 kernel/src/kindling/  the embedded from-scratch Kindling bytecode language (compute surface)
 kernel/src/isolation.rs  EL0 user mode and the hardware isolation boundary
-kernel/src/net.rs        the virtio-net driver and the Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP stack and fetch
+kernel/src/net.rs        the virtio-net driver, the Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP/HTTP stack, the TLS 1.3 client driver, and fetch
 kernel/src/proto.rs      pure UDP/DNS/TCP/HTTP wire logic (host-tested), no hardware access
+kernel/src/tls.rs        pure TLS 1.3 logic: HKDF key schedule, record framing, ClientHello/handshake parse (host-tested vs RFC 8448)
+kernel/src/sha2.rs       from-scratch SHA-256, SHA-512, HMAC-SHA256 (host-tested vs NIST/RFC vectors)
+kernel/src/x25519.rs     from-scratch X25519 ECDH (host-tested vs RFC 7748)
+kernel/src/ed25519.rs    from-scratch Ed25519 signature verification (host-tested vs RFC 8032)
+kernel/src/x509.rs       from-scratch X.509/ASN.1 DER certificate parser
 logic/      host crate that re-includes the kernel's pure modules for cargo test (incl. the Kindling differential)
 sim/        the original pure-std kernel simulator (concepts layer)
 scripts/    boot-test.sh, the QEMU boot correctness gate
@@ -233,7 +264,22 @@ probe's write syscall trusts the pointer it is handed, which is fine for the
 in-tree probe but would need bounds checking before running untrusted user
 pointers. Kindling values live on the kernel heap during a run, which the wipe
 covers but which is not zeroed the instant a value is dropped. The network stack
-is polled and drives one TCP connection at a time over HTTP/1.0, with no TLS or
-HTTPS, no congestion control, and minimal retransmit, enough to fetch bytes over
-a real handshake rather than a general socket layer. DESIGN.md states these in
-full.
+is polled and drives one TCP connection at a time, with no congestion control and
+minimal retransmit, enough to fetch bytes over a real handshake rather than a
+general socket layer.
+
+The TLS 1.3 client is real but deliberately scoped. It establishes an
+authenticated-to-leaf TLS 1.3 channel: it verifies the server CertificateVerify
+signature against the leaf certificate's public key (Ed25519 today) and matches
+the SNI host against the certificate name, so the transcript is cryptographically
+bound to that leaf key. What it does not yet do, and does not pretend to do, is
+anchor the leaf to an embedded root-CA trust store, so a server presenting a
+self-signed or otherwise unrooted leaf still completes as authenticated-to-leaf
+rather than authenticated-to-a-trusted-CA. For leaves signed with ECDSA or RSA
+(rather than Ed25519) it establishes the encrypted channel but reports that the
+leaf signature scheme was not verified. There is no certificate revocation check,
+no wall-clock date enforcement (Aurora has no real-time clock, so validity dates
+are parsed and displayed but not compared to "now"), no TLS 1.2 fallback, one
+cipher suite (TLS_CHACHA20_POLY1305_SHA256) and one group (x25519), and one
+connection at a time. A `-k` insecure/pinned mode exists for the deterministic
+local self-test. DESIGN.md states these in full.

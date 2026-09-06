@@ -40,9 +40,11 @@ aarch64 assembly. Aurora resolves this without duplicating code.
 - `logic/` is a host crate. It re-includes the kernel's pure modules with
   `#[path]` so `cargo test` compiles and checks the exact same source that runs
   on the metal. The pure modules are the ChaCha20 and Poly1305 primitives, the
-  frame allocator, the heap allocator, the page-table math, and the scheduler
-  run-queue policy. None of them touch hardware, `asm!`, or MMIO, so they behave
-  identically on host and target.
+  SHA-256/SHA-512/HMAC and the whole TLS 1.3 key schedule and record logic, the
+  x25519 and Ed25519 curve code, the X.509 parser, the UDP/DNS/TCP/HTTP wire
+  logic, the frame allocator, the heap allocator, the page-table math, and the
+  scheduler run-queue policy. None of them touch hardware, `asm!`, or MMIO, so
+  they behave identically on host and target.
 - `sim/` is the original pure-std concepts simulator, kept as a teaching layer.
 
 The single source of truth is `kernel/src/`. The host tests never fork the code.
@@ -279,14 +281,81 @@ teardown and a later network use re-initializes the device cleanly. The boot tes
 proves this: it fetches a payload carrying a sentinel, wipes, and asserts the
 sentinel count across the network region is zero.
 
-Honest limits: one TCP connection at a time, HTTP/1.0 only with no TLS or HTTPS,
-polling rather than interrupts, no congestion control, and only minimal
-retransmit. It is enough to fetch bytes over a real handshake, not a general
-socket layer.
+Honest limits: one TCP connection at a time, HTTP/1.0, polling rather than
+interrupts, no congestion control, and only minimal retransmit. It is enough to
+fetch bytes over a real handshake, not a general socket layer.
 
 Network access is gated by CAP_NET, which is grantable and revocable rather than a
 hard no. It is off by default, so the trace-free posture holds unless a session
 runs `cap net`, and `cap revoke net` turns it off again.
+
+## TLS 1.3 over the wire
+
+`fetch https://host/path` runs a from-scratch TLS 1.3 client (RFC 8446) on TCP
+443, then the existing HTTP/1.0 request over the encrypted channel. As with the
+rest of the stack, the pure protocol logic lives where the host tests can reach
+it and the I/O driver lives beside virtio-net.
+
+The pieces, all from scratch with zero external crates.
+
+- Key exchange is x25519 (RFC 7748), a from-scratch Montgomery-ladder scalar
+  multiplication over GF(2^255-19) in `kernel/src/x25519.rs`, checked against the
+  RFC 7748 test vectors.
+- The key schedule is HKDF-Extract and HKDF-Expand over HMAC-SHA256 (RFC 5869)
+  plus the full TLS 1.3 schedule of RFC 8446 section 7: the early, handshake, and
+  master secrets, the client and server handshake and application traffic secrets,
+  the traffic keys and IVs, and the finished keys. SHA-256, SHA-512, and
+  HMAC-SHA256 are from scratch in `kernel/src/sha2.rs`. All of this lives in
+  `kernel/src/tls.rs` and is checked on the host against the RFC 8448 worked TLS
+  1.3 handshake trace, end to end, secret by secret.
+- The cipher suite is TLS_CHACHA20_POLY1305_SHA256, so the record AEAD is the
+  in-tree RFC 8439 ChaCha20-Poly1305 in `crypto.rs`, reused unchanged. The record
+  layer builds TLS 1.3 records with the section 5 nonce construction (the static
+  IV XOR the record sequence number) and the record header as the AEAD associated
+  data, with separate sequence counters per direction and per key epoch.
+- The handshake state machine sends a ClientHello offering the one suite, x25519
+  supported_groups and key_share, a signature_algorithms list, and the SNI
+  server_name, parses the ServerHello, derives the handshake keys, then decrypts
+  EncryptedExtensions, Certificate, CertificateVerify, and the server Finished,
+  verifies the server Finished MAC against the transcript, sends the client
+  Finished, and switches to application data. The whole client second flight
+  (ChangeCipherSpec, Finished, and the HTTP request) is sent as a single TCP
+  segment so a polled client with no data retransmit has the smallest possible
+  surface for a dropped segment.
+- Certificate handling parses the X.509 chain as ASN.1 DER in
+  `kernel/src/x509.rs`, pulls the leaf public key, subject CN, subject
+  alternative names, and validity dates, and verifies the server
+  CertificateVerify signature against the leaf public key with a from-scratch
+  Ed25519 verifier in `kernel/src/ed25519.rs` (RFC 8032), which reuses the
+  from-scratch SHA-512. The SNI host is matched against the certificate dNSName or
+  iPAddress SANs, or the subject CN.
+
+The exact validation level, stated plainly. When the server CertificateVerify is
+Ed25519 and its signature verifies against the leaf key and the SNI host matches
+the certificate, Aurora reports authenticated-to-leaf: the handshake transcript is
+cryptographically bound to that leaf public key and the name matches. It does not
+anchor the leaf to an embedded root-CA trust store, so a self-signed or otherwise
+unrooted leaf still reaches only authenticated-to-leaf, not
+authenticated-to-a-trusted-CA. When the leaf signature scheme is one Aurora does
+not yet verify (ECDSA or RSA), it establishes the encrypted channel and reports
+that the leaf binding was not verified rather than pretending otherwise. There is
+no revocation check and no wall-clock date enforcement, because Aurora has no
+real-time clock, so validity dates are parsed and shown but not compared against
+the current time. A `-k` insecure/pinned mode is available for the deterministic
+local self-test, where the point is to prove the record layer, handshake, and
+HTTP-over-TLS end to end against a self-signed server.
+
+Amnesia extends to TLS. The x25519 private key, all of the traffic secrets and
+keys, the transcript state, and the decrypted response plaintext live in the
+reserved network region (`TlsScratch` inside the netbuf region), so a wipe scrubs
+every one of them. The boot test proves it: it fetches a sentinel-carrying payload
+over TLS, confirms the decrypted sentinel is present in the network region, wipes,
+and asserts the sentinel is gone.
+
+Honest limits: TLS 1.3 only with no TLS 1.2 fallback, one cipher suite and one
+key-exchange group, one connection at a time, no session resumption or 0-RTT
+(tickets received after the handshake are ignored), and the certificate-validation
+scope described above.
 
 ## The wipe
 
@@ -407,9 +476,20 @@ then asserts the markers that can only appear if each subsystem worked:
   GET against a local host server the script starts on the fly, returning a known
   unique payload the test asserts byte for byte, which makes the TCP and HTTP path
   deterministic without depending on external internet,
+- the TLS 1.3 path, a real handshake from inside Aurora against a local TLS 1.3
+  server (OpenSSL `s_server` with a self-signed Ed25519 leaf, ChaCha20 only) that
+  the script starts on the fly: the test asserts the negotiated
+  TLS_CHACHA20_POLY1305_SHA256 suite and x25519 group, that the server ed25519
+  CertificateVerify verified against the leaf key, that Aurora reached
+  authenticated-to-leaf, and that the exact known payload came back over the
+  encrypted channel, making the TLS record layer, key schedule, and HTTP-over-TLS
+  deterministic without external internet,
+- a best-effort live HTTPS fetch of `https://example.com/` over the real internet,
+  which is printed and not a hard failure when offline,
 - the amnesia of fetched bytes, a payload with a sentinel fetched into the network
-  buffers, then wiped, then the sentinel scanned to zero across the whole network
-  region,
+  buffers over both HTTP and TLS, then wiped, then the sentinel scanned to zero
+  across the whole network region (proving the decrypted TLS plaintext is scrubbed
+  too),
 - a best-effort live DNS lookup through the built-in nameserver, which prints the
   A record when online and is not a hard failure when offline,
 - a clean power-off, which means the machine exited through semihosting.
@@ -452,7 +532,11 @@ time over HTTP/1.0, with no TLS or HTTPS, no congestion control, and only minima
 retransmit, enough to fetch bytes over a real handshake, not a general socket
 layer. The wipe does
 not scrub the live kernel stack frames it is running on, the code, or the in-use
-heap. The kernel still runs on a single core with secondary cores parked.
+heap. The kernel still runs on a single core with secondary cores parked. The TLS
+1.3 client reaches authenticated-to-leaf but does not anchor to a root CA, does
+not check revocation, does not enforce wall-clock validity dates (there is no
+real-time clock), has no TLS 1.2 fallback, verifies only Ed25519 CertificateVerify
+signatures today, and handles one connection at a time.
 
 ## The concepts layer
 
