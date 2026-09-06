@@ -798,6 +798,78 @@ else
 fi
 rm -f "$DOUT"
 
+# --- Slow/never-answering DNS receive-deadline gate --------------------------
+# The DNS/ARP/ICMP receive loops in net.rs are now bounded by the same absolute
+# per-operation deadline that bounds TLS/HTTP. Prove it for DNS: an inlined local
+# UDP server accepts the query but NEVER replies (a black-hole nameserver). The
+# resolver's small poll caps alone would let it retransmit and spin; the absolute
+# deadline (a few seconds, not reset by traffic) must abort `resolve` PROMPTLY
+# with a clean error, and the shell must answer a normal command afterward. QEMU
+# user-net forwards guest traffic to 10.0.2.2:PORT to the host loopback, so the
+# guest reaches the server via a non-privileged port passed to `resolve`. A
+# regression that ignores the deadline would spin and be killed by the watchdog.
+info "[dns-gate] separate QEMU run: a never-answering nameserver must hit the receive deadline, not hang"
+DNS_PORT="$(free_port)"
+python3 - "$DNS_PORT" <<'PY' >/dev/null 2>&1 &
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+# Receive every DNS query and NEVER reply: a black-hole nameserver. Only an
+# ABSOLUTE per-operation deadline can stop the resolver against this.
+while True:
+    try:
+        s.recvfrom(2048)
+    except Exception:
+        break
+PY
+DNS_PID=$!
+disown "$DNS_PID" 2>/dev/null || true
+
+NOUT="$(mktemp)"
+NSTART=$(date +%s)
+{
+    printf 'session start\n'
+    printf 'cap net\n'
+    printf 'resolve blackhole.aurora.test 10.0.2.2 %s\n' "$DNS_PORT"
+    printf 'compute 7 + 7\n'
+    printf 'exit\n'
+} | run_with_timeout 30 \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+        -kernel "$ELF" >"$NOUT" 2>&1
+DNS_RC=$?
+NEND=$(date +%s)
+kill "$DNS_PID" >/dev/null 2>&1
+echo "----------------------------------------------------------------"
+cat "$NOUT"
+echo "----------------------------------------------------------------"
+info "[dns-gate] elapsed $((NEND-NSTART))s (an unbounded resolver would be killed at the 30s watchdog)"
+
+require_n() { # description, pattern (fixed-string)
+    if grep -qF -- "$2" "$NOUT"; then
+        green "  ok   $1"
+    else
+        red   "  MISS $1  (expected to find: $2)"
+        FAIL=1
+    fi
+}
+
+require_n "dns-gate hit the receive deadline"   "[dns] no response within deadline"
+require_n "dns-gate shell alive after blackhole" "-> 14"
+require_n "dns-gate clean shutdown"             "[shutdown] powering off"
+# A prompt clean exit (rc 0) proves the never-answering nameserver no longer hangs
+# the core: a regression spins retransmitting and QEMU is killed with rc 124.
+if [ "$DNS_RC" -ne 0 ]; then
+    red   "  MISS dns-gate QEMU did not exit cleanly (rc=$DNS_RC; 124 means the resolver hung the core)"
+    FAIL=1
+else
+    green "  ok   dns-gate QEMU exited 0 (never-answering nameserver did not hang the core)"
+fi
+rm -f "$NOUT"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     green "BOOT TEST PASSED"

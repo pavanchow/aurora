@@ -64,7 +64,7 @@ pub fn exec(line: &str) -> bool {
             println!("  net <msg>            round-trip a message over CAP_NET (needs CAP_NET)");
             println!("  fetch [-k] <url>     HTTP/1.0 GET over http:// or TLS 1.3 https:// (needs CAP_NET)");
             println!("  tlsinfo [-k] <host>  TLS 1.3 handshake, show group/suite/cert (needs CAP_NET)");
-            println!("  resolve <name> [ns]  live DNS A-record lookup (needs CAP_NET)");
+            println!("  resolve <name> [ns [port]] live DNS A-record lookup (needs CAP_NET)");
             println!("  netamnesia [-k] <url> prove fetched bytes (incl. TLS plaintext) do not survive a wipe");
             println!("  el0test              run an EL0 user task that must fault on kernel RAM");
             println!("  wipe                 scrub all session RAM now (kill switch)");
@@ -201,7 +201,7 @@ pub fn exec(line: &str) -> bool {
         "resolve" => {
             let rest = line.strip_prefix("resolve").unwrap_or("").trim();
             if rest.is_empty() {
-                println!("usage: resolve <name> [nameserver-ip]");
+                println!("usage: resolve <name> [nameserver-ip] [port]");
             } else {
                 crate::net::shell_resolve(rest);
             }

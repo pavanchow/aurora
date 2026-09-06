@@ -506,10 +506,25 @@ fn cntfrq() -> u64 {
 const RECV_DEADLINE_SECS: u64 = 15;
 const RECV_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+// The control-plane resolvers (DNS over UDP, ARP, ICMP echo) complete in tens of
+// milliseconds against a live peer, so they get a tighter few-second absolute
+// deadline than the multi-second fetch budget. It is the same RecvBudget
+// discipline on the same generic-timer clock: the deadline is ABSOLUTE for the
+// operation and a byte arriving never resets it, so a resolver or L2 peer that
+// never answers, answers slowly, or floods frames cannot run the loop past it.
+const RESOLVE_DEADLINE_SECS: u64 = 4;
+
 /// Start a fresh total receive budget for one fetch operation, anchored to the
 /// current generic-timer tick.
 fn new_recv_budget() -> proto::RecvBudget {
     let deadline = cntfrq().saturating_mul(RECV_DEADLINE_SECS);
+    proto::RecvBudget::new(cntpct(), deadline, RECV_MAX_BYTES)
+}
+
+/// Start a fresh absolute receive budget for one control-plane resolver operation
+/// (DNS/ARP/ICMP), anchored to the current generic-timer tick.
+fn new_resolve_budget() -> proto::RecvBudget {
+    let deadline = cntfrq().saturating_mul(RESOLVE_DEADLINE_SECS);
     proto::RecvBudget::new(cntpct(), deadline, RECV_MAX_BYTES)
 }
 
@@ -536,9 +551,17 @@ fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     f[38..42].copy_from_slice(&ip);
     send_frame(&f);
 
+    // Absolute per-operation deadline: the small poll cap is the inner bound, but
+    // a peer that floods non-matching frames (each looking like progress) cannot
+    // keep the loop spinning past the deadline, checked every iteration.
+    let mut budget = new_resolve_budget();
     let mut buf = [0u8; BUF_SIZE];
     for _ in 0..8 {
+        if budget.over_budget(cntpct()) {
+            return None;
+        }
         let n = recv_frame(&mut buf)?;
+        budget.charge(n);
         if n >= 42 {
             let et = u16::from_be_bytes([buf[12], buf[13]]);
             let op = u16::from_be_bytes([buf[20], buf[21]]);
@@ -628,9 +651,16 @@ fn icmp_echo(gw: [u8; 6], token: &[u8]) -> Option<[u8; 16]> {
 
     send_frame(&f[..frame_len]);
 
+    // Absolute per-operation deadline, same discipline as DNS/ARP: the poll cap is
+    // the inner bound, the deadline the ceiling, checked every iteration.
+    let mut budget = new_resolve_budget();
     let mut buf = [0u8; BUF_SIZE];
     for _ in 0..8 {
+        if budget.over_budget(cntpct()) {
+            return None;
+        }
         let n = recv_frame(&mut buf)?;
+        budget.charge(n);
         if n >= frame_len {
             let et = u16::from_be_bytes([buf[12], buf[13]]);
             if et == ET_IPV4 && buf[23] == 1 {
@@ -658,7 +688,7 @@ fn rand16() -> u16 {
 /// Resolve `name`'s A record via the DNS server `ns_ip` over UDP. Returns the
 /// IPv4 address, or None on timeout or no address. The response lands in the
 /// wiped netbuf region.
-pub fn resolve(name: &str, ns_ip: [u8; 4]) -> Option<[u8; 4]> {
+pub fn resolve(name: &str, ns_ip: [u8; 4], ns_port: u16) -> Option<[u8; 4]> {
     if !init() {
         return None;
     }
@@ -669,17 +699,32 @@ pub fn resolve(name: &str, ns_ip: [u8; 4]) -> Option<[u8; 4]> {
     let mut query = [0u8; 512];
     let qlen = proto::build_dns_query(id, name, &mut query)?;
     let mut udp = [0u8; 600];
-    let ulen = proto::build_udp(OUR_IP, ns_ip, src_port, 53, &query[..qlen], &mut udp)?;
+    let ulen = proto::build_udp(OUR_IP, ns_ip, src_port, ns_port, &query[..qlen], &mut udp)?;
 
-    for _ in 0..4 {
+    // One absolute per-operation deadline governs the whole resolve: retransmits
+    // continue only while it holds, and it is re-checked before every poll. The
+    // 16-frame inner loop is kept as the small poll cap (inner bound). A
+    // nameserver that never answers, answers slowly, or floods non-matching frames
+    // therefore cannot run the loop past the deadline; it returns a clean error.
+    let mut budget = new_resolve_budget();
+    loop {
+        if budget.over_budget(cntpct()) {
+            println!("[dns] no response within deadline");
+            return None;
+        }
         send_ipv4(ns_mac, ns_ip, proto::IP_PROTO_UDP, &udp[..ulen]);
         // Wait for a matching UDP response from the nameserver.
         for _ in 0..16 {
+            if budget.over_budget(cntpct()) {
+                println!("[dns] no response within deadline");
+                return None;
+            }
             let rx: &mut [u8] = unsafe { &mut (*nb()).rx_scratch };
             let n = match recv_frame(rx) {
                 Some(n) => n,
                 None => break, // timeout: retransmit the query
             };
+            budget.charge(n);
             if n < 34 || u16::from_be_bytes([rx[12], rx[13]]) != ET_IPV4 {
                 continue;
             }
@@ -697,7 +742,7 @@ pub fn resolve(name: &str, ns_ip: [u8; 4]) -> Option<[u8; 4]> {
                 Some(x) => x,
                 None => continue,
             };
-            if sp != 53 {
+            if sp != ns_port {
                 continue;
             }
             let ds = off + poff;
@@ -708,7 +753,6 @@ pub fn resolve(name: &str, ns_ip: [u8; 4]) -> Option<[u8; 4]> {
             }
         }
     }
-    None
 }
 
 // --- TCP one-shot client -----------------------------------------------------
@@ -1526,7 +1570,7 @@ fn resolve_host(host: &str) -> Option<[u8; 4]> {
     if let Some(ip) = parse_ipv4(host) {
         return Some(ip);
     }
-    resolve(host, DEFAULT_NS)
+    resolve(host, DEFAULT_NS, 53)
 }
 
 fn print_ip(ip: [u8; 4]) {
@@ -1713,15 +1757,18 @@ pub fn shell_resolve(args: &str) {
     let name = match it.next() {
         Some(n) => n,
         None => {
-            println!("usage: resolve <name> [nameserver-ip]");
+            println!("usage: resolve <name> [nameserver-ip] [port]");
             return;
         }
     };
     let ns = it.next().and_then(parse_ipv4).unwrap_or(DEFAULT_NS);
+    // Optional trailing nameserver port (defaults to 53). Lets a test point the
+    // resolver at a local UDP server on a non-privileged port.
+    let ns_port = it.next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(53);
     print!("[dns] resolving {} via ", name);
     print_ip(ns);
-    print!(" ... ");
-    match resolve(name, ns) {
+    print!(":{} ... ", ns_port);
+    match resolve(name, ns, ns_port) {
         Some(ip) => {
             print!("A record ");
             print_ip(ip);

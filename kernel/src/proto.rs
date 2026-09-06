@@ -475,6 +475,27 @@ mod tests {
     }
 
     #[test]
+    fn recv_budget_resolver_deadline_bounds_a_dribbling_nameserver() {
+        // The DNS/ARP/ICMP resolvers use the same RecvBudget with a few-second
+        // absolute deadline. Model a nameserver that dribbles non-matching frames:
+        // every poll charges a byte (so any idle counter would reset), yet the
+        // absolute deadline still trips at the same point and is never pushed out.
+        let freq = 62_500_000u64; // a representative generic-timer frequency
+        let deadline = freq * 4; // RESOLVE_DEADLINE_SECS = 4
+        let start = 1_000_000u64;
+        let mut b = RecvBudget::new(start, deadline, RECV_MAX_TEST);
+        // Three seconds of dribbled frames: still within the deadline.
+        for s in 1..=3 {
+            assert!(b.charge(60)); // a frame arrives, well under the cap
+            assert!(!b.over_budget(start + freq * s));
+        }
+        // Just past four seconds the absolute deadline trips regardless of traffic.
+        assert!(b.over_budget(start + deadline + 1));
+    }
+
+    const RECV_MAX_TEST: usize = 4 * 1024 * 1024;
+
+    #[test]
     fn recv_budget_legit_fetch_stays_within_budget() {
         // A real fetch: a few hundred KB within a second, far under a multi-MB
         // cap and a multi-second deadline, never trips.
