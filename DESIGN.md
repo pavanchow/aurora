@@ -95,22 +95,31 @@ fault printer.
 
 An unrecoverable EL1 fault is treated as a kill-switch trigger. Before the fault
 handler halts, it calls the same `wipe` the panic path and the shell use, so the
-session key, the vault, the frame pool, the network buffers, and the free stack
-are zeroed even on a crash. It then rescans the managed session RAM for the
+session key, the vault, the frame pool, the network buffers, and the whole kernel
+stack are zeroed even on a crash. It then rescans the managed session RAM for the
 amnesia sentinel and prints how many copies remain, which is zero after a good
 scrub, so a crash produces the same measured proof a clean wipe does. The scrub
 runs in a fault context, so it stays simple and non-allocating and touches only
-mapped regions, never the guard page. One context is not fully covered: a genuine
-deep EL1h stack overflow faults on the stack-push at exception entry itself, and
-that entry re-faults against the guard page a handful of times, marching the
-saved trap frames across the 4 KiB guard into the top of the heap before the
-push finally lands on mapped memory and the wipe path runs. Those few kilobytes
-of trap frames sit in the heap, which a running-kernel wipe does not scrub, so
-that one pathological path is a best-effort scrub rather than a complete one. The
-parser nesting bound below removes the only reachable trigger for such an
-overflow from the compute surface, and the key and vault live in reserved regions
-above the stack that a downward overflow never reaches and that the wipe zeros
-regardless.
+mapped regions, never the guard page.
+
+### Dedicated exception stack
+
+The fault edge is closed with a dedicated exception stack. The linker reserves a
+separate 128 KiB region, and the vector entries switch `SP` to the top of that
+region on entry to a CPU fault, before the trap frame is pushed. So even a fault
+taken while the main kernel stack is exhausted saves its 272-byte frame on the
+exception stack, never below the stack guard page in the heap. The synchronous
+EL1h vector distinguishes the two cases by peeking `ESR_EL1` before it saves any
+register (stashing `x0` in `tpidr_el1` so no syscall argument is disturbed): an
+`SVC` keeps using the per-task stack, because the scheduler switches tasks by
+returning a different frame pointer and that frame must live on the task's own
+stack, while a fault switches to the exception stack. IRQ entry is unchanged for
+the same reason. The three always-fatal vectors switch unconditionally. The fault
+handler then reports the trap-frame address and confirms it lies in the exception
+stack and not in the heap, and because the wipe now runs from the exception
+stack, it scrubs the entire main kernel stack rather than only the part below the
+live frames. The key and vault also live in reserved regions above the stack that
+a downward overflow never reaches and that the wipe zeros regardless.
 
 ### Stack guard page
 
@@ -241,16 +250,30 @@ ever-growing value into a "compute memory limit exceeded" error instead of OOMin
 the global allocator.
 
 Those three are runtime limits, but the compile step in front of the VM recurses
-too. The recursive-descent parser descends once per level of expression grouping,
-prefix `!`/`-`, call, and binary nesting, and a deeply nested program (a few
-thousand nested `(` or `!`) used to overflow the native kernel stack during
-parsing and take a raw EL1 data abort before any VM limit could apply, which
-halted the kernel without wiping. The parser now threads an explicit nesting
-counter through those recursive productions and aborts with a clean "nesting too
-deep" compile error once the depth passes 256, chosen with a wide margin below the
-few-thousand depth where the stack was seen to fault. The compiler carries a
-matching defensive bound as it walks the tree. Both surface as ordinary compile
-errors, so a hostile deeply-nested program is rejected before it runs and the
+too, and that was the source of a whole class of parser crashes. A deeply nested
+program (thousands of levels of nested `(`, `!`, `{`, `if`, `while`, calls, a
+right-associative `a = a = ... = 1` chain, or a long binary-operator chain) used
+to overflow the native kernel stack during parsing and take a raw EL1 data abort,
+or exhaust the heap, before any VM limit could apply, which halted the kernel
+without wiping. Earlier point fixes guarded only some productions, so other
+shapes still crashed.
+
+The fix is a single uniform bound. Every recursive production of the
+recursive-descent parser (statement, block, `if`, `while`, assignment, every
+binary-precedence level, unary, call, grouping, and primary) increments one shared
+depth counter on entry through a scope guard that unwinds it on every exit path,
+and checks it against one cap (512). Because a long left-nested operator chain
+deepens the tree without recursing, each binary operator also consumes one unit of
+that same budget, so `1+1+...` is bounded exactly like `(((...)))`. No production
+can be forgotten, so no input shape can drive the parser past a fixed depth, and
+the resulting tree is shallow enough to compile and to drop without overflowing.
+The compiler carries a matching defensive bound (1024) across its statement and
+expression walks. A second bound caps the total AST node count (100k) as the tree
+is built, and a program-size cap (16 KiB total across every line of a multi-line
+program, enforced before the input is even tokenized) turns a large but shallow
+program into a clean "program too large" error instead of OOMing the heap in the
+lexer. Every one of these surfaces as an ordinary "nesting too deep" or "program
+too large" compile error, so a hostile program is rejected before it runs and the
 shell keeps going, exactly like the runtime limits. When any limit trips, the
 error is printed, the compute scratch is scrubbed, and the shell keeps running and
 accepts the next command. The

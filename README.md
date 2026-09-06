@@ -48,9 +48,11 @@ throwaway compute.
 - Wipes even on a crash. Any unrecoverable EL1 fault scrubs the session before it
   halts and then reprints the sentinel count, which is zero, so a data abort
   cannot leave the key or vault resident. An unmapped guard page sits directly
-  below the kernel stack, so a stack overflow faults at a known boundary and
-  routes into that wipe-then-halt path instead of scribbling into other memory.
-  The `faulttest` command exercises this path on purpose.
+  below the kernel stack, so a stack overflow faults at a known boundary, and a
+  dedicated exception stack takes the trap frame on any CPU fault, so the frame is
+  saved off the heap even when the main stack is exhausted (the fault handler
+  reports the frame address and confirms it is on the exception stack, not the
+  heap). The `faulttest` command exercises this path on purpose.
 - Keeps decrypted secrets off the stack. The vault put and get staging buffers
   and the session read buffer are zeroed with volatile writes the instant an
   operation finishes, so a read secret does not survive on the kernel stack.
@@ -61,10 +63,13 @@ throwaway compute.
   resource limits (instruction count, call depth, and live heap bytes) stop a
   runaway or hostile program: unbounded recursion and ever-growing allocation
   each return a clean runtime error instead of crashing the kernel, and the shell
-  keeps running. A fourth, compile-time bound caps expression nesting depth, so a
-  deeply nested program (thousands of nested `(` or `!`) is rejected with a clean
-  "nesting too deep" error before it can overflow the native kernel stack during
-  parsing. This is Aurora's general compute surface for an agent.
+  keeps running. Compile-time bounds close the parser off too: one uniform depth
+  cap covers every recursive production (grouping, unary, calls, assignment
+  chains, nested blocks, `if`/`while`, and long operator chains), and a total
+  program-size and AST-node budget reject an oversized program, so a deeply nested
+  or huge program is rejected with a clean "nesting too deep" or "program too
+  large" error rather than overflowing the kernel stack or OOMing the heap. This
+  is Aurora's general compute surface for an agent.
 - Enforces isolation in hardware. Agent code can run at EL0 with its own
   translation permissions, so a user task cannot read or write the vault, the
   session key, or any other kernel RAM directly. An attempt faults to the kernel,
