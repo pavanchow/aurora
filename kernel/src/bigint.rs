@@ -104,6 +104,7 @@ impl Big {
     ///
     /// If the value needs more bytes than `out.len()`, only the low `out.len()`
     /// bytes are written (the high bytes are dropped).
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_be_bytes(&self, out: &mut [u8]) {
         let n = out.len();
         let mut i = 0;
@@ -131,6 +132,11 @@ impl Big {
 
     pub fn is_zero(&self) -> bool {
         self.len == 0
+    }
+
+    /// Test bit `i` (0 = least significant). Out-of-range bits read as 0.
+    pub fn bit_test(&self, i: usize) -> bool {
+        self.bit(i)
     }
 
     pub fn is_even(&self) -> bool {

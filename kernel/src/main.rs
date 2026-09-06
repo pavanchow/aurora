@@ -15,6 +15,7 @@ mod amnesia;
 mod bigint;
 mod boot;
 mod crypto;
+mod ecdsa_p256;
 mod ed25519;
 mod entropy;
 mod exceptions;

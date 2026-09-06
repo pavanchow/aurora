@@ -21,6 +21,9 @@ pub mod x25519;
 #[path = "../../kernel/src/ed25519.rs"]
 pub mod ed25519;
 
+#[path = "../../kernel/src/ecdsa_p256.rs"]
+pub mod ecdsa_p256;
+
 #[path = "../../kernel/src/x509.rs"]
 pub mod x509;
 
