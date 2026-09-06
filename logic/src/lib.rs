@@ -27,6 +27,12 @@ pub mod ecdsa_p256;
 #[path = "../../kernel/src/x509.rs"]
 pub mod x509;
 
+#[path = "../../kernel/src/trust_store.rs"]
+pub mod trust_store;
+
+#[path = "../../kernel/src/certchain.rs"]
+pub mod certchain;
+
 #[path = "../../kernel/src/tls.rs"]
 pub mod tls;
 

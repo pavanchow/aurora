@@ -81,9 +81,14 @@ s.close()
 PY
 }
 
-# Pick free TCP ports on the loopback for the two servers.
+# Pick free TCP ports on the loopback for the servers.
 HTTP_PORT="$(free_port)"
 HTTPS_PORT="$(free_port)"
+# Ports for the authenticated ECDSA chain gate and its rejection cases.
+AUTH_PORT="$(free_port)"
+UNTRUST_PORT="$(free_port)"
+BROKEN_PORT="$(free_port)"
+WRONG_PORT="$(free_port)"
 
 info "[server] starting local HTTP server on 127.0.0.1:${HTTP_PORT} serving collatz.txt"
 ( cd "$WWW_DIR" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 ) \
@@ -116,11 +121,57 @@ else
     red "[server] openssl unavailable; the local HTTPS gate cannot run"
 fi
 
+# The AUTHENTICATED gate: a deterministic ECDSA P-256 chain (root -> intermediate
+# -> leaf, CN=aurora.local, SAN IP:10.0.2.2) whose root public key is embedded in
+# the kernel trust store (kernel/src/trust_store.rs). Each s_server sends the leaf
+# plus the intermediate (via -cert_chain); Aurora anchors the intermediate to the
+# embedded root. Three sibling servers present the rejection cases: an untrusted
+# root, a tampered (broken) chain signature, and a wrong-name leaf.
+CHAIN_OK=0
+CHAIN_DIR=""
+AUTH_PID=""; UNTRUST_PID=""; BROKEN_PID=""; WRONG_PID=""
+if [ "$HTTPS_OK" -eq 1 ]; then
+    CHAIN_DIR="$(mktemp -d)"
+    if bash "$ROOT/scripts/gen-testchain.sh" "$CHAIN_DIR" >/dev/null 2>&1; then
+        CHAIN_OK=1
+    else
+        red "[server] test-chain generation failed; the authenticated TLS gate cannot run"
+    fi
+fi
+
+# Start one TLS 1.3 s_server that serves secure.txt over an ECDSA leaf, sending
+# the given chain. $1 port, $2 leaf cert, $3 leaf key, $4 chain file.
+start_chain_server() {
+    ( cd "$WWW_DIR" && exec openssl s_server -accept "$1" -naccept 60 \
+        -cert "$2" -key "$3" -cert_chain "$4" -tls1_3 \
+        -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -HTTP ) \
+        >"$WWW_DIR/chain-$1.log" 2>&1 &
+    echo $!
+}
+
+if [ "$CHAIN_OK" -eq 1 ]; then
+    info "[server] starting authenticated ECDSA chain server on 127.0.0.1:${AUTH_PORT}"
+    AUTH_PID="$(start_chain_server "$AUTH_PORT" "$CHAIN_DIR/leaf.crt" "$CHAIN_DIR/leaf.key" "$CHAIN_DIR/int.crt")"
+    info "[server] starting untrusted-root server on 127.0.0.1:${UNTRUST_PORT}"
+    UNTRUST_PID="$(start_chain_server "$UNTRUST_PORT" "$CHAIN_DIR/uleaf.crt" "$CHAIN_DIR/uleaf.key" "$CHAIN_DIR/uint.crt")"
+    info "[server] starting broken-chain server on 127.0.0.1:${BROKEN_PORT}"
+    BROKEN_PID="$(start_chain_server "$BROKEN_PORT" "$CHAIN_DIR/brokenleaf.crt" "$CHAIN_DIR/leaf.key" "$CHAIN_DIR/int.crt")"
+    info "[server] starting wrong-name server on 127.0.0.1:${WRONG_PORT}"
+    WRONG_PID="$(start_chain_server "$WRONG_PORT" "$CHAIN_DIR/leafwrong.crt" "$CHAIN_DIR/leafwrong.key" "$CHAIN_DIR/int.crt")"
+    for p in "$AUTH_PID" "$UNTRUST_PID" "$BROKEN_PID" "$WRONG_PID"; do
+        disown "$p" 2>/dev/null || true
+    done
+fi
+
 cleanup() {
     kill "$HTTP_PID" >/dev/null 2>&1
     [ -n "$HTTPS_PID" ] && kill "$HTTPS_PID" >/dev/null 2>&1
+    for p in "$AUTH_PID" "$UNTRUST_PID" "$BROKEN_PID" "$WRONG_PID"; do
+        [ -n "$p" ] && kill "$p" >/dev/null 2>&1
+    done
     rm -f "$OUT"
     rm -rf "$WWW_DIR"
+    [ -n "$CHAIN_DIR" ] && rm -rf "$CHAIN_DIR"
 }
 trap cleanup EXIT
 
@@ -142,6 +193,12 @@ PY
 }
 wait_port "$HTTP_PORT"
 [ "$HTTPS_OK" -eq 1 ] && wait_port "$HTTPS_PORT"
+if [ "$CHAIN_OK" -eq 1 ]; then
+    wait_port "$AUTH_PORT"
+    wait_port "$UNTRUST_PORT"
+    wait_port "$BROKEN_PORT"
+    wait_port "$WRONG_PORT"
+fi
 
 info "[2/3] booting in QEMU (timeout ${TIMEOUT_SECS}s)"
 
@@ -173,12 +230,27 @@ shell_script() {
     # server (10.0.2.2 is the QEMU user-net host alias), and a best-effort live
     # DNS lookup via the built-in nameserver at 10.0.2.3.
     printf 'fetch http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
-    # TLS 1.3: an authenticated-to-leaf https fetch against the local Ed25519
-    # server (by IP, matched via the cert IP SAN), the negotiated-parameter dump,
-    # and a best-effort live fetch of the real HTTPS web.
+    # TLS 1.3 AUTHENTICATED gate: a plain (no -k) https fetch against the local
+    # ECDSA chain server. The chain must verify to the embedded root, the ECDSA
+    # CertificateVerify must verify against the leaf, the host name must match the
+    # IP SAN, and the fetch must return the payload at validation level
+    # "authenticated". Then the negotiated-parameter dump.
+    if [ "$CHAIN_OK" -eq 1 ]; then
+        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$AUTH_PORT"
+        printf 'tlsinfo https://10.0.2.2:%s/secure.txt\n' "$AUTH_PORT"
+        # Rejection cases: each must fail cleanly with a clear reason and leave the
+        # shell alive (a distinctive compute answers after each).
+        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$UNTRUST_PORT"
+        printf 'compute 200 + 1\n'
+        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$BROKEN_PORT"
+        printf 'compute 200 + 2\n'
+        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$WRONG_PORT"
+        printf 'compute 200 + 3\n'
+    fi
+    # -k insecure self-test against the self-signed Ed25519 server: the full
+    # handshake and record layer still run and return the payload.
     if [ "$HTTPS_OK" -eq 1 ]; then
-        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
-        printf 'tlsinfo https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
+        printf 'fetch -k https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
     fi
     printf 'fetch https://example.com/\n'
     printf 'resolve example.com\n'
@@ -485,22 +557,37 @@ require "fetch returned payload"   "$PAYLOAD"
 require "netamnesia scrubs bytes"  "post-wipe scan: real-body fingerprint present 0 time(s) in the network buffers"
 require "netamnesia PASS"          "[netamnesia] PASS:"
 
-# TLS 1.3: the deterministic HARD gate. From inside Aurora, the from-scratch TLS
-# client must complete a real TLS 1.3 handshake with the local Ed25519 server,
-# negotiate ChaCha20-Poly1305 + x25519, verify the server's ed25519
-# CertificateVerify against the leaf key, reach authenticated-to-leaf (name via
-# the IP SAN), and return the exact known payload over the encrypted channel.
-if [ "$HTTPS_OK" -eq 1 ]; then
-    require "TLS 1.3 cipher suite"      "cipher suite: TLS_CHACHA20_POLY1305_SHA256"
-    require "TLS 1.3 x25519 exchange"   "key exchange group: x25519"
-    require "TLS ed25519 CertVerify ok" "leaf signature verified: true"
-    require "TLS authenticated-to-leaf" "validation level: authenticated-to-leaf"
-    require "TLS cert subject parsed"   "certificate subject CN: aurora.local"
-    require "https fetch payload"       "$PAYLOAD"
-    require "https netamnesia ran"      "fetched over TLS 1.3"
+# TLS 1.3: the deterministic AUTHENTICATED gate. From inside Aurora, the
+# from-scratch TLS client must complete a real TLS 1.3 handshake with the local
+# ECDSA chain server, negotiate ChaCha20-Poly1305 + x25519, verify the presented
+# chain (leaf -> intermediate) up to the embedded root public key, verify the
+# ECDSA CertificateVerify against the leaf, match the host by the IP SAN, and
+# return the exact known payload at validation level "authenticated". The three
+# rejection cases (untrusted root, tampered chain signature, wrong name) must each
+# fail the fetch cleanly with a clear reason while the shell keeps answering.
+if [ "$CHAIN_OK" -eq 1 ]; then
+    require "TLS 1.3 cipher suite"        "cipher suite: TLS_CHACHA20_POLY1305_SHA256"
+    require "TLS 1.3 x25519 exchange"     "key exchange group: x25519"
+    require "TLS ECDSA CertVerify scheme" "server CertificateVerify scheme: ecdsa_secp256r1_sha256"
+    require "TLS leaf signature verified" "leaf signature verified: true"
+    require "TLS chain authenticated"     "validation level: authenticated"
+    require "TLS cert subject parsed"     "certificate subject CN: aurora.local"
+    require "authenticated fetch payload" "$PAYLOAD"
+    require "reject untrusted root"       "certificate rejected: no path to an embedded trusted root"
+    require "shell alive after untrusted" "-> 201"
+    require "reject broken chain sig"     "certificate rejected: a chain signature did not verify"
+    require "shell alive after broken"    "-> 202"
+    require "reject wrong host name"      "certificate rejected: host name does not match certificate"
+    require "shell alive after wrongname" "-> 203"
 else
-    red "  MISS local HTTPS gate could not run (openssl missing)"
+    red "  MISS authenticated TLS gate could not run (openssl or chain generation missing)"
     FAIL=1
+fi
+# The -k insecure self-test against the self-signed Ed25519 server: the full
+# handshake and record layer still run and return the payload.
+if [ "$HTTPS_OK" -eq 1 ]; then
+    require "insecure -k self-signed"   "insecure/pinned self-test mode"
+    require "https netamnesia ran"      "fetched over TLS 1.3"
 fi
 
 # Live real-web HTTPS is best-effort: surface it, never hard-fail when offline.

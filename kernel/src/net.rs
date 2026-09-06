@@ -28,7 +28,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::proto::{self, DnsResult};
 use crate::tls::{self, TrafficKeys};
-use crate::{ed25519, entropy, mem, print, println, x25519, x509};
+use crate::{certchain, ecdsa_p256, ed25519, entropy, mem, print, println, x25519, x509};
 
 // virtio-mmio on QEMU virt: 32 slots, 0x200 bytes apart, from 0x0a00_0000.
 const MMIO_BASE: usize = 0x0a00_0000;
@@ -133,15 +133,21 @@ const TLS_SUBJECT_MAX: usize = 128;
 /// The certificate-validation level Aurora actually reached on a connection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CertLevel {
-    /// The CertificateVerify signature was verified against the leaf public key
-    /// (the handshake transcript is cryptographically bound to that key) AND the
-    /// SNI host matched the certificate. This is authenticated-to-leaf.
-    AuthenticatedToLeaf,
+    /// Full authentication: the presented certificate chain verified to an
+    /// embedded trusted root, the CertificateVerify signature verified against the
+    /// leaf public key (binding the handshake to that key), and the requested host
+    /// name matched the leaf. This is the only level a plain `https://` fetch of a
+    /// trusted server reaches.
+    Authenticated,
     /// The encrypted channel was established and the leaf certificate parsed, but
-    /// its signature scheme is one Aurora does not yet verify (e.g. ECDSA/RSA), so
-    /// the leaf binding was not proven. Documented, never overclaimed.
+    /// the chain did not anchor to an embedded root, or the leaf's signature scheme
+    /// is one Aurora does not yet verify (e.g. RSA). The leaf binding to a trusted
+    /// issuer was not proven. Documented, never overclaimed. Reached only on the
+    /// best-effort live path; a plain `https://` fetch rejects instead.
     EncryptedUnverified,
-    /// An explicit insecure mode used for the deterministic local self-test.
+    /// An explicit insecure mode (`-k`) used for the deterministic local self-test
+    /// against a self-signed server: the full handshake and record layer still run,
+    /// but chain, name, and leaf-binding failures are not fatal.
     InsecurePinned,
 }
 
@@ -164,11 +170,13 @@ struct TlsSession {
     transcript: tls::Transcript,
     // Leaf-certificate facts captured while processing the handshake, used to
     // verify CertificateVerify and to report the validation level.
-    leaf_pub: [u8; 32],
-    leaf_alg: u8, // 0 ed25519, 1 ec-p256, 2 rsa, 3 other
-    th_cert: [u8; 32], // transcript hash through the Certificate message
-    name_ok: bool,
-    leaf_verified: bool,
+    leaf_pub: [u8; 32],   // Ed25519 leaf public key
+    leaf_ec: [u8; 65],    // EC P-256 leaf public key (SEC1 uncompressed point)
+    leaf_alg: u8,         // 0 ed25519, 1 ec-p256, 2 rsa, 3 other
+    th_cert: [u8; 32],    // transcript hash through the Certificate message
+    name_ok: bool,        // requested host matched the leaf SAN/CN
+    chain_ok: bool,       // presented chain verified to an embedded trusted root
+    leaf_verified: bool,  // CertificateVerify signature verified against the leaf
     cipher_suite: u16,
     group: u16,
     sig_scheme: u16,
@@ -1138,74 +1146,151 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                 ts.session.transcript.update(&ts.hs_buf[..msg_total]);
             }
             tls::HS_CERTIFICATE => {
-                let ts = unsafe { &mut *nb_tls() };
-                ts.session.transcript.update(&ts.hs_buf[..msg_total]);
-                ts.session.subject_len = 0;
-                ts.session.name_ok = false;
-                ts.session.leaf_alg = 3;
-                if let Some(der) = tls::certificate_leaf(&ts.hs_buf[..msg_total]) {
-                    if let Some(cert) = x509::parse_certificate(der) {
-                        if let Some(cn) = cert.subject_cn() {
-                            let n = core::cmp::min(cn.len(), TLS_SUBJECT_MAX);
-                            ts.session.subject[..n].copy_from_slice(&cn[..n]);
-                            ts.session.subject_len = n;
-                        }
-                        ts.session.name_ok = match parse_ipv4(host) {
-                            Some(ip) => cert.matches_ip(&ip),
-                            None => cert.matches_dns(host),
-                        };
-                        ts.session.leaf_alg = match cert.spki_alg {
-                            x509::SpkiAlg::Ed25519 => {
-                                if cert.spki_key.len() == 32 {
-                                    ts.session.leaf_pub.copy_from_slice(cert.spki_key);
-                                }
-                                0
+                {
+                    let ts = unsafe { &mut *nb_tls() };
+                    ts.session.transcript.update(&ts.hs_buf[..msg_total]);
+                }
+                // Verify the presented chain to an embedded root and extract the
+                // leaf's facts. Parse under a shared borrow, copying everything we
+                // need to the stack before taking a mutable borrow to store it.
+                let mut chain_ok = false;
+                let mut name_ok = false;
+                let mut leaf_alg = 3u8;
+                let mut leaf_pub = [0u8; 32];
+                let mut leaf_ec = [0u8; 65];
+                let mut subj = [0u8; TLS_SUBJECT_MAX];
+                let mut subj_len = 0usize;
+                let mut reject: Option<&'static str> = None;
+                {
+                    let ts = unsafe { &*nb_tls() };
+                    let msg = &ts.hs_buf[..msg_total];
+                    match certchain::verify_message(msg) {
+                        Ok(_) => chain_ok = true,
+                        Err(e) => {
+                            if !insecure {
+                                reject = Some(e.as_str());
                             }
-                            x509::SpkiAlg::EcP256 => 1,
-                            x509::SpkiAlg::Rsa => 2,
-                            _ => 3,
-                        };
+                        }
+                    }
+                    // The leaf is the first presented certificate; parse it for the
+                    // name check, subject display, and the CertificateVerify key.
+                    let mut ders: [&[u8]; certchain::MAX_CHAIN] = [&[]; certchain::MAX_CHAIN];
+                    let leaf_der = match certchain::split_certs(msg, &mut ders) {
+                        Some((c, _)) if c > 0 => Some(ders[0]),
+                        _ => None,
+                    };
+                    if let Some(der) = leaf_der {
+                        if let Some(cert) = x509::parse_certificate(der) {
+                            if let Some(cn) = cert.subject_cn() {
+                                let n = core::cmp::min(cn.len(), TLS_SUBJECT_MAX);
+                                subj[..n].copy_from_slice(&cn[..n]);
+                                subj_len = n;
+                            }
+                            name_ok = match parse_ipv4(host) {
+                                Some(ip) => cert.matches_ip(&ip),
+                                None => cert.matches_dns(host),
+                            };
+                            leaf_alg = match cert.spki_alg {
+                                x509::SpkiAlg::Ed25519 => {
+                                    if cert.spki_key.len() == 32 {
+                                        leaf_pub.copy_from_slice(cert.spki_key);
+                                    }
+                                    0
+                                }
+                                x509::SpkiAlg::EcP256 => {
+                                    if let Some(pt) = cert.ec_p256_point() {
+                                        leaf_ec.copy_from_slice(pt);
+                                    }
+                                    1
+                                }
+                                x509::SpkiAlg::Rsa => 2,
+                                _ => 3,
+                            };
+                        }
                     }
                 }
-                ts.session.th_cert = ts.session.transcript.hash();
+                // A trusted chain that does not match the requested host is still a
+                // rejection in secure mode.
+                if reject.is_none() && !insecure && !name_ok {
+                    reject = Some("host name does not match certificate");
+                }
+                if let Some(why) = reject {
+                    println!("[tls] certificate rejected: {}", why);
+                    return None;
+                }
+                {
+                    let ts = unsafe { &mut *nb_tls() };
+                    ts.session.chain_ok = chain_ok;
+                    ts.session.name_ok = name_ok;
+                    ts.session.leaf_alg = leaf_alg;
+                    ts.session.leaf_pub = leaf_pub;
+                    ts.session.leaf_ec = leaf_ec;
+                    ts.session.subject[..subj_len].copy_from_slice(&subj[..subj_len]);
+                    ts.session.subject_len = subj_len;
+                    ts.session.th_cert = ts.session.transcript.hash();
+                }
             }
             tls::HS_CERTIFICATE_VERIFY => {
                 // Copy the pieces we need to the stack, then verify, then extend
                 // the transcript. This keeps the borrows on `nb().tls` disjoint.
+                // The signature buffer holds an Ed25519 (64), ECDSA DER (~72), or
+                // RSA (up to 512) CertificateVerify signature.
                 let mut scheme = 0u16;
-                let mut sig = [0u8; 64];
+                let mut sig = [0u8; 512];
                 let mut sig_len = 0usize;
-                let (th, leaf_pub, alg, name_ok) = {
+                let (th, leaf_pub, leaf_ec, alg, name_ok, chain_ok) = {
                     let ts = unsafe { &*nb_tls() };
                     if let Some((sc, s)) = tls::parse_certificate_verify(&ts.hs_buf[..msg_total]) {
                         scheme = sc;
-                        sig_len = core::cmp::min(s.len(), 64);
+                        sig_len = core::cmp::min(s.len(), sig.len());
                         sig[..sig_len].copy_from_slice(&s[..sig_len]);
                     }
-                    (ts.session.th_cert, ts.session.leaf_pub, ts.session.leaf_alg, ts.session.name_ok)
+                    (
+                        ts.session.th_cert,
+                        ts.session.leaf_pub,
+                        ts.session.leaf_ec,
+                        ts.session.leaf_alg,
+                        ts.session.name_ok,
+                        ts.session.chain_ok,
+                    )
                 };
                 let mut content = [0u8; 130];
                 let clen = tls::certificate_verify_content(&th, &mut content);
-                let verified = scheme == tls::SIG_ED25519
-                    && alg == 0
-                    && sig_len == 64
-                    && ed25519::verify(&leaf_pub, &content[..clen], &sig);
-                let level = if scheme == tls::SIG_ED25519 && alg == 0 {
-                    // We can verify this scheme against the leaf key.
-                    if verified && name_ok {
-                        CertLevel::AuthenticatedToLeaf
-                    } else if insecure {
-                        CertLevel::InsecurePinned
+                // Verify the CertificateVerify signature against the leaf key, for
+                // the schemes Aurora supports and that match the leaf key type.
+                let (supported, verified) = match scheme {
+                    tls::SIG_ED25519 if alg == 0 => {
+                        let ok = if sig_len == 64 {
+                            let mut s = [0u8; 64];
+                            s.copy_from_slice(&sig[..64]);
+                            ed25519::verify(&leaf_pub, &content[..clen], &s)
+                        } else {
+                            false
+                        };
+                        (true, ok)
+                    }
+                    tls::SIG_ECDSA_P256_SHA256 if alg == 1 => {
+                        let digest = crate::sha2::sha256(&content[..clen]);
+                        (true, ecdsa_p256::verify_der(&leaf_ec, &digest, &sig[..sig_len]))
+                    }
+                    _ => (false, false),
+                };
+                let level = if insecure {
+                    CertLevel::InsecurePinned
+                } else if supported {
+                    // Secure mode: the chain and name were already enforced at the
+                    // Certificate message. The leaf binding must now verify too.
+                    if verified && chain_ok && name_ok {
+                        CertLevel::Authenticated
                     } else {
-                        // A genuine ed25519 authentication failure aborts.
+                        println!("[tls] CertificateVerify signature did not verify against the leaf key");
                         return None;
                     }
-                } else if insecure {
-                    CertLevel::InsecurePinned
                 } else {
-                    // Scheme Aurora cannot verify yet (ECDSA/RSA): the channel is
-                    // encrypted but the leaf binding is not proven. Stated plainly.
-                    CertLevel::EncryptedUnverified
+                    // A scheme Aurora cannot verify against this leaf (e.g. RSA):
+                    // the leaf binding is not proven, so a secure fetch must reject.
+                    println!("[tls] unsupported CertificateVerify signature scheme (leaf not authenticated)");
+                    return None;
                 };
                 let ts = unsafe { &mut *nb_tls() };
                 ts.session.sig_scheme = scheme;
@@ -1278,6 +1363,7 @@ fn https_get(
         s.level = CertLevel::EncryptedUnverified;
         s.leaf_verified = false;
         s.name_ok = false;
+        s.chain_ok = false;
         s.sig_scheme = 0;
         s.subject_len = 0;
         s.cipher_suite = 0;
@@ -1477,9 +1563,9 @@ fn https_get(
 
 fn cert_level_str(l: CertLevel) -> &'static str {
     match l {
-        CertLevel::AuthenticatedToLeaf => "authenticated-to-leaf (CertificateVerify bound to leaf key + SNI matched)",
-        CertLevel::EncryptedUnverified => "encrypted, leaf signature scheme not verified by Aurora",
-        CertLevel::InsecurePinned => "insecure/pinned self-test mode",
+        CertLevel::Authenticated => "authenticated (chain verified to a trusted root, CertificateVerify bound to the leaf key, host name matched)",
+        CertLevel::EncryptedUnverified => "encrypted, certificate chain not anchored to a trusted root",
+        CertLevel::InsecurePinned => "insecure/pinned self-test mode (-k)",
     }
 }
 
