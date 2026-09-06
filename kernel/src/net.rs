@@ -28,7 +28,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::proto::{self, DnsResult};
 use crate::tls::{self, TrafficKeys};
-use crate::{certchain, ecdsa_p256, ed25519, entropy, mem, print, println, x25519, x509};
+use crate::{certchain, ecdsa_p256, ed25519, entropy, mem, print, println, rsa, x25519, x509};
 
 // virtio-mmio on QEMU virt: 32 slots, 0x200 bytes apart, from 0x0a00_0000.
 const MMIO_BASE: usize = 0x0a00_0000;
@@ -129,6 +129,8 @@ const TLS_STREAM_MAX: usize = 34816;
 const TLS_HS_MAX: usize = 16384;
 const TLS_REC_MAX: usize = 17408;
 const TLS_SUBJECT_MAX: usize = 128;
+// A DER RSAPublicKey for keys up to RSA-4096 fits comfortably here.
+const TLS_RSA_KEY_MAX: usize = 560;
 
 /// The certificate-validation level Aurora actually reached on a connection.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,6 +174,8 @@ struct TlsSession {
     // verify CertificateVerify and to report the validation level.
     leaf_pub: [u8; 32],   // Ed25519 leaf public key
     leaf_ec: [u8; 65],    // EC P-256 leaf public key (SEC1 uncompressed point)
+    leaf_rsa: [u8; TLS_RSA_KEY_MAX], // RSA leaf public key (DER RSAPublicKey)
+    leaf_rsa_len: usize,
     leaf_alg: u8,         // 0 ed25519, 1 ec-p256, 2 rsa, 3 other
     th_cert: [u8; 32],    // transcript hash through the Certificate message
     name_ok: bool,        // requested host matched the leaf SAN/CN
@@ -1158,6 +1162,8 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                 let mut leaf_alg = 3u8;
                 let mut leaf_pub = [0u8; 32];
                 let mut leaf_ec = [0u8; 65];
+                let mut leaf_rsa = [0u8; TLS_RSA_KEY_MAX];
+                let mut leaf_rsa_len = 0usize;
                 let mut subj = [0u8; TLS_SUBJECT_MAX];
                 let mut subj_len = 0usize;
                 let mut reject: Option<&'static str> = None;
@@ -1203,7 +1209,13 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                                     }
                                     1
                                 }
-                                x509::SpkiAlg::Rsa => 2,
+                                x509::SpkiAlg::Rsa => {
+                                    if cert.spki_key.len() <= TLS_RSA_KEY_MAX {
+                                        leaf_rsa_len = cert.spki_key.len();
+                                        leaf_rsa[..leaf_rsa_len].copy_from_slice(cert.spki_key);
+                                    }
+                                    2
+                                }
                                 _ => 3,
                             };
                         }
@@ -1225,6 +1237,8 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                     ts.session.leaf_alg = leaf_alg;
                     ts.session.leaf_pub = leaf_pub;
                     ts.session.leaf_ec = leaf_ec;
+                    ts.session.leaf_rsa = leaf_rsa;
+                    ts.session.leaf_rsa_len = leaf_rsa_len;
                     ts.session.subject[..subj_len].copy_from_slice(&subj[..subj_len]);
                     ts.session.subject_len = subj_len;
                     ts.session.th_cert = ts.session.transcript.hash();
@@ -1238,6 +1252,8 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                 let mut scheme = 0u16;
                 let mut sig = [0u8; 512];
                 let mut sig_len = 0usize;
+                let mut leaf_rsa = [0u8; TLS_RSA_KEY_MAX];
+                let leaf_rsa_len = unsafe { (*nb_tls()).session.leaf_rsa_len };
                 let (th, leaf_pub, leaf_ec, alg, name_ok, chain_ok) = {
                     let ts = unsafe { &*nb_tls() };
                     if let Some((sc, s)) = tls::parse_certificate_verify(&ts.hs_buf[..msg_total]) {
@@ -1245,6 +1261,7 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                         sig_len = core::cmp::min(s.len(), sig.len());
                         sig[..sig_len].copy_from_slice(&s[..sig_len]);
                     }
+                    leaf_rsa[..leaf_rsa_len].copy_from_slice(&ts.session.leaf_rsa[..leaf_rsa_len]);
                     (
                         ts.session.th_cert,
                         ts.session.leaf_pub,
@@ -1273,6 +1290,10 @@ fn tls_process_handshake(hs_len: &mut usize, host: &str, insecure: bool) -> Opti
                         let digest = crate::sha2::sha256(&content[..clen]);
                         (true, ecdsa_p256::verify_der(&leaf_ec, &digest, &sig[..sig_len]))
                     }
+                    tls::SIG_RSA_PSS_RSAE_SHA256 if alg == 2 => (
+                        true,
+                        rsa::verify_pss_sha256(&leaf_rsa[..leaf_rsa_len], &content[..clen], &sig[..sig_len]),
+                    ),
                     _ => (false, false),
                 };
                 let level = if insecure {

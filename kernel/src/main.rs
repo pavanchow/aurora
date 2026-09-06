@@ -41,6 +41,7 @@ mod shell;
 mod sync;
 mod syscall;
 mod timer;
+mod rsa;
 mod tls;
 mod trust_store;
 mod uaccess;
