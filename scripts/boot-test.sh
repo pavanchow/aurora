@@ -55,16 +55,24 @@ OUT="$(mktemp)"
 PAYLOAD='COLLATZ-STOP-27=111 PEAK=9232 SENTINEL=Zx9Q'
 WWW_DIR="$(mktemp -d)"
 printf '%s\n' "$PAYLOAD" > "$WWW_DIR/collatz.txt"
+# The https server (openssl s_server -HTTP) serves a file verbatim, so bake a
+# complete HTTP/1.0 response whose body is the same known payload + sentinel.
+printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s\n' "$PAYLOAD" \
+    > "$WWW_DIR/secure.txt"
 
-# Pick a free TCP port on the loopback for the server.
-HTTP_PORT="$(python3 - <<'PY'
+free_port() {
+    python3 - <<'PY'
 import socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
 PY
-)"
+}
+
+# Pick free TCP ports on the loopback for the two servers.
+HTTP_PORT="$(free_port)"
+HTTPS_PORT="$(free_port)"
 
 info "[server] starting local HTTP server on 127.0.0.1:${HTTP_PORT} serving collatz.txt"
 ( cd "$WWW_DIR" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 ) \
@@ -72,25 +80,57 @@ info "[server] starting local HTTP server on 127.0.0.1:${HTTP_PORT} serving coll
 HTTP_PID=$!
 disown "$HTTP_PID" 2>/dev/null || true
 
+# A local TLS 1.3 server for the deterministic HTTPS gate: a from-scratch client
+# needs a real TLS 1.3 peer. Use OpenSSL s_server with a self-signed Ed25519 leaf
+# (so the ed25519 CertificateVerify path is exercised) and only the ChaCha20
+# cipher suite Aurora offers. The SAN carries IP:10.0.2.2 so a by-IP fetch can
+# reach the authenticated-to-leaf level without DNS.
+HTTPS_OK=0
+if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey ed25519 -keyout "$WWW_DIR/srv.key" -out "$WWW_DIR/srv.crt" \
+        -days 3650 -nodes -subj "/CN=aurora.local" \
+        -addext "subjectAltName=DNS:aurora.local,IP:10.0.2.2" >/dev/null 2>&1 \
+        && HTTPS_OK=1
+fi
+HTTPS_PID=""
+if [ "$HTTPS_OK" -eq 1 ]; then
+    info "[server] starting local TLS 1.3 server on 127.0.0.1:${HTTPS_PORT} (Ed25519, ChaCha20)"
+    ( cd "$WWW_DIR" && exec openssl s_server -accept "$HTTPS_PORT" -naccept 60 \
+        -cert srv.crt -key srv.key -tls1_3 \
+        -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -HTTP ) \
+        >"$WWW_DIR/tls-server.log" 2>&1 &
+    HTTPS_PID=$!
+    disown "$HTTPS_PID" 2>/dev/null || true
+else
+    red "[server] openssl unavailable; the local HTTPS gate cannot run"
+fi
+
 cleanup() {
     kill "$HTTP_PID" >/dev/null 2>&1
+    [ -n "$HTTPS_PID" ] && kill "$HTTPS_PID" >/dev/null 2>&1
     rm -f "$OUT"
     rm -rf "$WWW_DIR"
 }
 trap cleanup EXIT
 
-# Wait until the server actually accepts connections (bounded).
-for _ in $(seq 1 50); do
-    if python3 - "$HTTP_PORT" <<'PY' 2>/dev/null
+# Wait until both servers actually accept connections (bounded).
+wait_port() {
+    local port="$1"
+    for _ in $(seq 1 50); do
+        if python3 - "$port" <<'PY' 2>/dev/null
 import socket, sys
 s = socket.socket()
 s.settimeout(0.2)
 s.connect(("127.0.0.1", int(sys.argv[1])))
 s.close()
 PY
-    then break; fi
-    sleep 0.1
-done
+        then return 0; fi
+        sleep 0.1
+    done
+    return 1
+}
+wait_port "$HTTP_PORT"
+[ "$HTTPS_OK" -eq 1 ] && wait_port "$HTTPS_PORT"
 
 info "[2/3] booting in QEMU (timeout ${TIMEOUT_SECS}s)"
 
@@ -114,6 +154,14 @@ shell_script() {
     # server (10.0.2.2 is the QEMU user-net host alias), and a best-effort live
     # DNS lookup via the built-in nameserver at 10.0.2.3.
     printf 'fetch http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
+    # TLS 1.3: an authenticated-to-leaf https fetch against the local Ed25519
+    # server (by IP, matched via the cert IP SAN), the negotiated-parameter dump,
+    # and a best-effort live fetch of the real HTTPS web.
+    if [ "$HTTPS_OK" -eq 1 ]; then
+        printf 'fetch https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
+        printf 'tlsinfo https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
+    fi
+    printf 'fetch https://example.com/\n'
     printf 'resolve example.com\n'
     # Multi-line Kindling program: sum of primes below 1000 (=76127), then
     # factor 561 and check Korselt's criterion (Carmichael number).
@@ -127,6 +175,14 @@ shell_script() {
     # Amnesia of network buffers: fetch a payload carrying a known sentinel, then
     # wipe, then prove the sentinel is gone from the whole network scratch region.
     printf 'netamnesia http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
+    # The http netamnesia wiped and tore the session down; start a fresh one to
+    # prove the same for a decrypted TLS 1.3 body (the sentinel arrives encrypted
+    # on the wire and is scrubbed as plaintext from the netbuf region).
+    if [ "$HTTPS_OK" -eq 1 ]; then
+        printf 'session start\n'
+        printf 'cap net\n'
+        printf 'netamnesia -k https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
+    fi
     printf 'wipe\n'
     printf 'ps\n'
     printf 'uptime\n'
@@ -224,6 +280,33 @@ require "fetch returned payload"   "$PAYLOAD"
 # gone from the whole network scratch region afterwards.
 require "netamnesia scrubs bytes"  "post-wipe scan: sentinel appears 0 time(s) in the network buffers"
 require "netamnesia PASS"          "[netamnesia] PASS:"
+
+# TLS 1.3: the deterministic HARD gate. From inside Aurora, the from-scratch TLS
+# client must complete a real TLS 1.3 handshake with the local Ed25519 server,
+# negotiate ChaCha20-Poly1305 + x25519, verify the server's ed25519
+# CertificateVerify against the leaf key, reach authenticated-to-leaf (name via
+# the IP SAN), and return the exact known payload over the encrypted channel.
+if [ "$HTTPS_OK" -eq 1 ]; then
+    require "TLS 1.3 cipher suite"      "cipher suite: TLS_CHACHA20_POLY1305_SHA256"
+    require "TLS 1.3 x25519 exchange"   "key exchange group: x25519"
+    require "TLS ed25519 CertVerify ok" "leaf signature verified: true"
+    require "TLS authenticated-to-leaf" "validation level: authenticated-to-leaf"
+    require "TLS cert subject parsed"   "certificate subject CN: aurora.local"
+    require "https fetch payload"       "$PAYLOAD"
+    require "https netamnesia ran"      "fetched over TLS 1.3"
+else
+    red "  MISS local HTTPS gate could not run (openssl missing)"
+    FAIL=1
+fi
+
+# Live real-web HTTPS is best-effort: surface it, never hard-fail when offline.
+if grep -qE "GET https://example.com.* -> resolving" "$OUT"; then
+    if awk '/GET https:\/\/example\.com/{f=1} f&&/HTTP status:/{print; exit}' "$OUT" | grep -q "HTTP status:"; then
+        green "  ok   live HTTPS to example.com over the real internet (best-effort)"
+    else
+        info  "  note live HTTPS example.com not reached (offline / no ChaCha), not a gate failure"
+    fi
+fi
 
 # Live DNS is best-effort: assert nothing hard, just surface the result.
 if grep -qF "live DNS ok" "$OUT"; then
