@@ -229,11 +229,6 @@ const GW_IP: [u8; 4] = [10, 0, 2, 2];
 // QEMU user-net built-in DNS. Overridable by `resolve <name> <ns-ip>`.
 const DEFAULT_NS: [u8; 4] = [10, 0, 2, 3];
 
-// A plaintext marker the fetch amnesia proof plants (via a served payload) and
-// then asserts is gone after a wipe. The boot-test server serves a body
-// containing this exact string.
-const NET_SENTINEL: &[u8] = b"SENTINEL=Zx9Q";
-
 #[inline]
 fn mb() {
     unsafe { core::arch::asm!("dsb sy", options(nostack)) };
@@ -1539,7 +1534,13 @@ pub fn shell_fetch(args: &str) {
             }
             println!();
         }
-        None => println!("[fetch] request failed (no response / TLS or HTTP error)"),
+        None => {
+            if is_tls && insecure {
+                println!("[fetch] request failed. -k relaxes the certificate check but still needs a TLS 1.3 peer that offers TLS_CHACHA20_POLY1305_SHA256 with x25519 (the bundled local self-test server provides one)");
+            } else {
+                println!("[fetch] request failed (no response / TLS or HTTP error)");
+            }
+        }
     }
 }
 
@@ -1594,7 +1595,13 @@ pub fn shell_tlsinfo(args: &str) {
             print_tls_info();
             println!("[tlsinfo] handshake ok, server answered HTTP {}", status);
         }
-        None => println!("[tlsinfo] handshake failed"),
+        None => {
+            if insecure {
+                println!("[tlsinfo] handshake failed. -k relaxes the certificate check but still needs a TLS 1.3 peer that offers TLS_CHACHA20_POLY1305_SHA256 with x25519 (the bundled local self-test server provides one)");
+            } else {
+                println!("[tlsinfo] handshake failed");
+            }
+        }
     }
 }
 
@@ -1664,31 +1671,61 @@ pub fn shell_netamnesia(args: &str) {
             return;
         }
     };
-    let ok = if is_tls {
-        https_get(ip, mac, port, host, path, insecure).is_some()
+    let result = if is_tls {
+        https_get(ip, mac, port, host, path, insecure)
     } else {
-        http_get(ip, mac, port, host, path).is_some()
+        http_get(ip, mac, port, host, path)
     };
     if is_tls {
         println!("[netamnesia] fetched over TLS 1.3; the decrypted body lives in the wiped netbuf region");
     }
-    let pre = scan_netbuf(NET_SENTINEL);
+    let (status, body_off, total) = match result {
+        Some(x) => x,
+        None => {
+            if is_tls && insecure {
+                println!("[netamnesia] FAIL: TLS 1.3 handshake failed. -k relaxes the certificate check but still needs a TLS 1.3 peer that offers TLS_CHACHA20_POLY1305_SHA256 with x25519 (the bundled local self-test server provides one)");
+            } else {
+                println!("[netamnesia] FAIL: fetch returned no response");
+            }
+            return;
+        }
+    };
+    let body_len = total.saturating_sub(body_off);
+    if body_len == 0 {
+        println!(
+            "[netamnesia] fetch returned 0 body bytes (status {}); nothing to prove, skipping",
+            status
+        );
+        return;
+    }
+    // Fingerprint the REAL fetched bytes: a contiguous slice of the actual
+    // response body, taken from the netbuf `body` region where it now lives.
+    // Copy it into this (live, above-SP) stack frame so the marker itself
+    // survives the wipe, which only scrubs the stack below the current SP.
+    let fp_len = core::cmp::min(body_len, 32);
+    let mut fp = [0u8; 32];
+    unsafe {
+        let src = (*nb()).body.as_ptr().add(body_off);
+        core::ptr::copy_nonoverlapping(src, fp.as_mut_ptr(), fp_len);
+    }
+    let fp = &fp[..fp_len];
+    let pre = scan_netbuf(fp);
     println!(
-        "[netamnesia] fetched (ok={}); sentinel appears {} time(s) in the network buffers before wipe",
-        ok, pre
+        "[netamnesia] fetched {} body bytes (status {}); {}-byte real-body fingerprint present {} time(s) in the network buffers before wipe",
+        body_len, status, fp_len, pre
     );
     if pre == 0 {
-        println!("[netamnesia] FAIL: sentinel not found in fetched bytes (payload/route wrong)");
+        println!("[netamnesia] FAIL: real fetched bytes not found in the netbuf region (route/buffer wrong)");
         return;
     }
     crate::wipe::wipe_and_report();
-    let post = scan_netbuf(NET_SENTINEL);
+    let post = scan_netbuf(fp);
     println!(
-        "[netamnesia] post-wipe scan: sentinel appears {} time(s) in the network buffers",
+        "[netamnesia] post-wipe scan: real-body fingerprint present {} time(s) in the network buffers",
         post
     );
     if post == 0 {
-        println!("[netamnesia] PASS: fetched network bytes scrubbed, sentinel fully gone");
+        println!("[netamnesia] PASS: real fetched network bytes scrubbed, fingerprint fully gone");
     } else {
         println!("[netamnesia] FAIL: fetched bytes survived the wipe");
     }
