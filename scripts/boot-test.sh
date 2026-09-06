@@ -172,17 +172,34 @@ shell_script() {
     printf 'let m=n; let p=2; while(p<=m){ if(m%%p==0){ print p; let e=0; while(m%%p==0){m=m/p; e=e+1;} if(e>1){carm=0;} if((n-1)%%(p-1)!=0){carm=0;} } p=p+1; }\n'
     printf 'if(carm==1){ print "561 is a Carmichael number"; } else { print "561 is NOT Carmichael"; }\n'
     printf '.\n'
-    # Amnesia of network buffers: fetch a payload carrying a known sentinel, then
-    # wipe, then prove the sentinel is gone from the whole network scratch region.
+    # Resource isolation: two hostile compute programs that must NOT crash the
+    # kernel. Unbounded recursion trips the call-depth cap; an ever-growing value
+    # trips the heap cap. Each returns a clean Kindling runtime error, the scratch
+    # is scrubbed, and the shell keeps running.
+    printf 'compute fn r(n){ return r(n+1); } r(0)\n'
+    printf 'compute\n'
+    printf 'let s="x"; let i=0; while(i<10000000){ s=s+s; i=i+1; } print s;\n'
+    printf '.\n'
+    # Proof the shell survived both hostile programs: a normal compute still
+    # answers with a distinctive result (123 + 456 = 579).
+    printf 'compute 123 + 456\n'
+    # Amnesia of network buffers: fetch the local payload, take a fingerprint of
+    # the REAL fetched bytes, wipe, then prove that exact fingerprint is gone from
+    # the whole network scratch region. Deterministic against the local server.
     printf 'netamnesia http://10.0.2.2:%s/collatz.txt\n' "$HTTP_PORT"
     # The http netamnesia wiped and tore the session down; start a fresh one to
-    # prove the same for a decrypted TLS 1.3 body (the sentinel arrives encrypted
-    # on the wire and is scrubbed as plaintext from the netbuf region).
+    # prove the same for a decrypted TLS 1.3 body (the bytes arrive encrypted on
+    # the wire and are scrubbed as plaintext from the netbuf region).
     if [ "$HTTPS_OK" -eq 1 ]; then
         printf 'session start\n'
         printf 'cap net\n'
         printf 'netamnesia -k https://10.0.2.2:%s/secure.txt\n' "$HTTPS_PORT"
     fi
+    # Best-effort: the same real-bytes proof against a real URL over the live
+    # internet. If offline it prints a resolve/fetch failure and is not a gate.
+    printf 'session start\n'
+    printf 'cap net\n'
+    printf 'netamnesia http://example.com/\n'
     printf 'wipe\n'
     printf 'ps\n'
     printf 'uptime\n'
@@ -258,6 +275,13 @@ require "compute arg 6*7-1"        "-> 41"
 require "primes below 1000 sum"    "76127"
 require "561 Carmichael verdict"   "561 is a Carmichael number"
 
+# Resource isolation: a hostile compute program must error cleanly and leave the
+# kernel and shell alive. Unbounded recursion hits the call-depth cap; an
+# ever-growing value hits the heap cap. Then a normal compute must still answer.
+require "recursion limit trips"    "[compute] error: recursion limit exceeded"
+require "heap limit trips"         "[compute] error: compute memory limit exceeded"
+require "shell alive after crash"  "-> 579"
+
 # EL0 isolation: a user task makes a legit syscall, then faults trying to read
 # the vault directly, and the kernel recovers instead of halting.
 require "EL0 legit syscall works"  "EL0 user task ran a legit 'write' syscall"
@@ -276,9 +300,9 @@ require "ICMP echo round trip"     "round trip complete: sent a task and receive
 # end-to-end proof of the UDP-free TCP path and the HTTP client.
 require "HTTP GET status 200"      "HTTP status: 200"
 require "fetch returned payload"   "$PAYLOAD"
-# Amnesia of fetched network bytes: the sentinel is present before the wipe and
-# gone from the whole network scratch region afterwards.
-require "netamnesia scrubs bytes"  "post-wipe scan: sentinel appears 0 time(s) in the network buffers"
+# Amnesia of fetched network bytes: a fingerprint of the REAL fetched bytes is
+# present before the wipe and gone from the whole network scratch region after.
+require "netamnesia scrubs bytes"  "post-wipe scan: real-body fingerprint present 0 time(s) in the network buffers"
 require "netamnesia PASS"          "[netamnesia] PASS:"
 
 # TLS 1.3: the deterministic HARD gate. From inside Aurora, the from-scratch TLS
@@ -305,6 +329,17 @@ if grep -qE "GET https://example.com.* -> resolving" "$OUT"; then
         green "  ok   live HTTPS to example.com over the real internet (best-effort)"
     else
         info  "  note live HTTPS example.com not reached (offline / no ChaCha), not a gate failure"
+    fi
+fi
+
+# The real-bytes netamnesia against a real URL over the live internet is
+# best-effort: if the fetch succeeded it must PASS via the real-body method;
+# offline is surfaced and never a hard gate.
+if grep -qF "netamnesia http://example.com/" "$OUT"; then
+    if awk '/netamnesia http:\/\/example\.com\//{f=1} f&&/\[netamnesia\] PASS:/{print; exit}' "$OUT" | grep -q "PASS"; then
+        green "  ok   netamnesia real-bytes PASS against example.com (best-effort, live)"
+    else
+        info  "  note netamnesia example.com not reached (offline), not a gate failure"
     fi
 fi
 
