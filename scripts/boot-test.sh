@@ -619,6 +619,87 @@ else
 fi
 rm -f "$FOUT"
 
+# --- TLS handshake work-budget gate ------------------------------------------
+# A hostile peer that floods trivial 6-byte ChangeCipherSpec records during the
+# TLS handshake must not pin the single core. This is a SEPARATE short QEMU run
+# against a local server that streams an unbounded CCS flood, which the reachable
+# pre-crypto ServerHello loop used to skip with a bare `continue` forever. Aurora
+# must now abort the handshake with a clean record/byte-budget error PROMPTLY
+# (not the 200s network timeout), and the shell must answer a normal command
+# afterward. If the budget regressed, the fetch hangs and this run times out
+# (rc 124), failing the gate outright.
+info "[ccs-gate] separate QEMU run: a ChangeCipherSpec flood must hit the handshake budget, not hang"
+CCS_PORT="$(free_port)"
+python3 - "$CCS_PORT" <<'PY' >/dev/null 2>&1 &
+import socket, sys, threading
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(8)
+ccs = bytes([20, 0x03, 0x03, 0x00, 0x01, 0x01]) * 4096  # infinite CCS flood
+def handle(c):
+    try:
+        while True:
+            c.sendall(ccs)
+    except Exception:
+        pass
+    try:
+        c.close()
+    except Exception:
+        pass
+while True:
+    try:
+        c, _ = s.accept()
+    except Exception:
+        break
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PY
+CCS_PID=$!
+disown "$CCS_PID" 2>/dev/null || true
+wait_port "$CCS_PORT"
+
+COUT="$(mktemp)"
+{
+    printf 'session start\n'
+    printf 'cap net\n'
+    printf 'fetch -k https://10.0.2.2:%s/x\n' "$CCS_PORT"
+    printf 'compute 7 + 7\n'
+    printf 'exit\n'
+} | run_with_timeout 30 \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+        -kernel "$ELF" >"$COUT" 2>&1
+CCS_RC=$?
+kill "$CCS_PID" >/dev/null 2>&1
+echo "----------------------------------------------------------------"
+cat "$COUT"
+echo "----------------------------------------------------------------"
+
+require_c() { # description, pattern (fixed-string)
+    if grep -qF -- "$2" "$COUT"; then
+        green "  ok   $1"
+    else
+        red   "  MISS $1  (expected to find: $2)"
+        FAIL=1
+    fi
+}
+
+require_c "ccs-gate hit the handshake budget" "[tls] handshake exceeded record/byte budget"
+require_c "ccs-gate shell alive after flood"  "-> 14"
+require_c "ccs-gate clean shutdown"           "[shutdown] powering off"
+# A prompt clean exit (rc 0) proves the flood no longer hangs the core: if the
+# budget regressed the fetch would spin on the CCS stream and QEMU would be killed
+# by the watchdog with rc 124.
+if [ "$CCS_RC" -ne 0 ]; then
+    red   "  MISS ccs-gate QEMU did not exit cleanly (rc=$CCS_RC; 124 means the flood hung the core)"
+    FAIL=1
+else
+    green "  ok   ccs-gate QEMU exited 0 (flood did not hang the core)"
+fi
+rm -f "$COUT"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     green "BOOT TEST PASSED"
