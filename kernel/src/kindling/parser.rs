@@ -8,16 +8,46 @@ use alloc::vec::Vec;
 use super::ast::{BinOp, Expr, FnDecl, Stmt, UnOp};
 use super::lexer::{Tok, Token};
 
+/// Maximum expression/grouping/unary nesting the parser will descend into before
+/// aborting with a clean error. Each nesting level costs a fixed handful of native
+/// stack frames in this recursive-descent parser, so the cap is set with a large
+/// margin below the depth at which the kernel stack was observed to overflow (a
+/// raw EL1 data abort started around 4000 levels). At 256 the deepest chain uses a
+/// few hundred native frames, well inside the 1 MiB kernel stack.
+pub const MAX_NESTING_DEPTH: usize = 256;
+
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser { toks, pos: 0, depth: 0 }
+    }
+
+    /// Enter one level of recursive expression nesting. Returns a clean error when
+    /// the cap is reached so the caller aborts parsing instead of overflowing the
+    /// native stack. Every `enter_nesting` that returns `Ok` must be paired with a
+    /// `leave_nesting` on the success path so sibling expressions do not inherit
+    /// each other's depth.
+    fn enter_nesting(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(format!(
+                "line {}: nesting too deep (limit {})",
+                self.line(),
+                MAX_NESTING_DEPTH
+            ));
+        }
+        Ok(())
+    }
+
+    fn leave_nesting(&mut self) {
+        self.depth -= 1;
     }
 
     fn peek(&self) -> &Tok {
@@ -187,7 +217,10 @@ impl Parser {
     }
 
     fn expression(&mut self) -> PResult<Expr> {
-        self.assignment()
+        self.enter_nesting()?;
+        let r = self.assignment();
+        self.leave_nesting();
+        r
     }
 
     fn assignment(&mut self) -> PResult<Expr> {
@@ -274,8 +307,12 @@ impl Parser {
         };
         if let Some(op) = op {
             self.advance();
-            let operand = self.unary()?;
-            return Ok(Expr::Unary(op, Box::new(operand)));
+            // A prefix `!`/`-` chain recurses directly into `unary` without going
+            // through `expression`, so it needs its own nesting bound.
+            self.enter_nesting()?;
+            let operand = self.unary();
+            self.leave_nesting();
+            return Ok(Expr::Unary(op, Box::new(operand?)));
         }
         self.call()
     }
@@ -325,4 +362,71 @@ impl Parser {
 /// Convenience helper: tokens straight to an AST.
 pub fn parse(toks: Vec<Token>) -> Result<Vec<Stmt>, String> {
     Parser::new(toks).parse_program()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kindling::lexer;
+
+    fn parse_src(src: &str) -> Result<Vec<Stmt>, String> {
+        parse(lexer::tokenize(src).expect("lex"))
+    }
+
+    #[test]
+    fn deep_grouping_errors_cleanly_instead_of_overflowing() {
+        let n = 20_000;
+        let mut src = String::new();
+        for _ in 0..n {
+            src.push('(');
+        }
+        src.push('1');
+        for _ in 0..n {
+            src.push(')');
+        }
+        src.push(';');
+        let err = parse_src(&src).expect_err("deep grouping must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn deep_unary_errors_cleanly_instead_of_overflowing() {
+        let mut src = String::new();
+        for _ in 0..20_000 {
+            src.push('!');
+        }
+        src.push_str("true;");
+        let err = parse_src(&src).expect_err("deep unary must be rejected");
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn nesting_just_below_the_cap_still_parses() {
+        // A grouping chain a little under the cap must remain valid: the counter
+        // is per-expression and unwinds, so depth does not leak across siblings.
+        let depth = MAX_NESTING_DEPTH - 8;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push('(');
+        }
+        src.push('1');
+        for _ in 0..depth {
+            src.push(')');
+        }
+        src.push(';');
+        assert!(parse_src(&src).is_ok(), "depth {depth} should parse");
+    }
+
+    #[test]
+    fn many_shallow_siblings_do_not_accumulate_depth() {
+        // Thousands of independent shallow expressions must not trip the cap: each
+        // one must decrement the depth counter back down on the way out.
+        let mut src = String::new();
+        for i in 0..5_000 {
+            src.push_str("let a");
+            src.push_str(&alloc::format!("{i}"));
+            src.push_str(" = (((1)));\n");
+        }
+        assert!(parse_src(&src).is_ok(), "shallow siblings must all parse");
+    }
 }

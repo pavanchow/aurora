@@ -40,9 +40,16 @@ enum VarLoc {
     Global(usize),
 }
 
+/// Defensive bound on how deep the compiler will recurse over an expression tree.
+/// The parser already caps nesting far below this, so a parser-produced AST never
+/// reaches it; it exists so a directly-constructed deep AST cannot overflow the
+/// native stack here either.
+pub const MAX_COMPILE_DEPTH: usize = 512;
+
 pub struct Compiler {
     funcs: Vec<FuncProto>,
     states: Vec<FnState>,
+    depth: usize,
 }
 
 type CResult<T> = Result<T, String>;
@@ -52,6 +59,7 @@ impl Compiler {
         Compiler {
             funcs: Vec::new(),
             states: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -376,6 +384,17 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> CResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_COMPILE_DEPTH {
+            self.depth -= 1;
+            return Err("nesting too deep".into());
+        }
+        let r = self.compile_expr_inner(expr);
+        self.depth -= 1;
+        r
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> CResult<()> {
         match expr {
             Expr::Int(n) => {
                 let idx = self.add_constant(Constant::Int(*n));
