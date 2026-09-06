@@ -51,8 +51,11 @@ throwaway compute.
 - Runs a sandboxed in-OS interpreter. The from-scratch Kindling bytecode language
   (lexer, parser, compiler, stack VM, garbage collector, zero dependencies) is
   embedded in the kernel and gated by CAP_COMPUTE. A Kindling program has no file,
-  network, or system access, it can only compute and print, and a step limit stops
-  a runaway program. This is Aurora's general compute surface for an agent.
+  network, or system access, it can only compute and print, and three resource
+  limits (instruction count, call depth, and live heap bytes) stop a runaway or
+  hostile program: unbounded recursion and ever-growing allocation each return a
+  clean runtime error instead of crashing the kernel, and the shell keeps running.
+  This is Aurora's general compute surface for an agent.
 - Enforces isolation in hardware. Agent code can run at EL0 with its own
   translation permissions, so a user task cannot read or write the vault, the
   session key, or any other kernel RAM directly. An attempt faults to the kernel,
@@ -181,7 +184,7 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `fetch [-k] <url>`  | GET `http://` or TLS 1.3 `https://` `host[:port]/path`, print the body (needs CAP_NET); `-k` is the insecure/pinned self-test mode |
 | `tlsinfo [-k] <host>` | TLS 1.3 handshake, print negotiated group, cipher suite, cert subject, and validation level (needs CAP_NET) |
 | `resolve <name> [ns]` | live DNS A-record lookup (needs CAP_NET)          |
-| `netamnesia [-k] <url>` | fetch a payload (http or https), wipe, prove the bytes (incl. decrypted TLS plaintext) are gone |
+| `netamnesia [-k] <url>` | fetch any real URL (http or https), fingerprint the real fetched bytes, wipe, prove that fingerprint (incl. decrypted TLS plaintext) is gone |
 | `el0test`           | run an EL0 user task that must fault on kernel RAM   |
 | `wipe`              | scrub the key, vault, frames, network buffers, and free stack to zero |
 | `panic`             | trigger a panic, which wipes before halting          |
@@ -193,7 +196,10 @@ movement, delete, and an up and down arrow command history.
 The compute surface is a real language. `compute 40 + 2` prints 42, and a
 multi-line program can define functions, loop, and print. For example, entering
 `compute` and then a program that sums the primes below 1000 prints 76127, and a
-program that factors 561 confirms it is a Carmichael number.
+program that factors 561 confirms it is a Carmichael number. It is also sandboxed
+for resources: a program that recurses forever or builds an ever-growing value
+returns a clean limit error (`recursion limit exceeded`, `compute memory limit
+exceeded`) instead of crashing the kernel, and the shell keeps accepting commands.
 
 ## Test
 

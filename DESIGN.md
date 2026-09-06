@@ -200,11 +200,19 @@ Compute is exposed as a syscall gated by CAP_COMPUTE and driven from the shell.
 `compute <expr>` runs a one-line program, and a bare `compute` reads lines until a
 lone `.` and runs the whole program. A Kindling program has no file, network, or
 system access, it can only compute and print, which makes it a safe compute
-surface for an untrusted agent. A step limit bounds total executed instructions so
-a runaway program cannot hang the single core. The program text is staged in a
-session scratch buffer that is scrubbed on the way out. This is what lets an agent
-define a function, loop, sum the primes below 1000, or factor a number entirely
-inside the session rather than being limited to a few built-in demos.
+surface for an untrusted agent. Three resource limits keep a hostile program from
+taking down the OS, and each trips a clean Kindling runtime error rather than a
+kernel panic or OOM. A step limit bounds total executed instructions so a runaway
+loop cannot hang the single core. A call-depth limit (1024 frames) turns unbounded
+recursion into a "recursion limit exceeded" error instead of exhausting the stack
+and heap. A live-heap ceiling (256 KiB, well under the 4 MiB kernel heap) turns an
+ever-growing value into a "compute memory limit exceeded" error instead of OOMing
+the global allocator. When any limit trips, the error is printed, the compute
+scratch is scrubbed, and the shell keeps running and accepts the next command. The
+program text is staged in a session scratch buffer that is scrubbed on the way out.
+This is what lets an agent define a function, loop, sum the primes below 1000, or
+factor a number entirely inside the session rather than being limited to a few
+built-in demos.
 
 The single source of truth is `kernel/src/kindling/`. The `logic` crate includes
 the same files to run the VM unit tests and a differential correctness gate that
@@ -277,9 +285,15 @@ Every network buffer, the virtio DMA rings, the per-frame receive scratch, and t
 fetched HTTP body, lives in a dedicated reserved region (`__netbuf_start` to
 `__netbuf_end`, see the linker script and `mem::netbuf_region_range`). The wipe
 scrubs that whole region and marks the NIC down, so fetched bytes never survive a
-teardown and a later network use re-initializes the device cleanly. The boot test
-proves this: it fetches a payload carrying a sentinel, wipes, and asserts the
-sentinel count across the network region is zero.
+teardown and a later network use re-initializes the device cleanly. The
+`netamnesia <url>` command proves this for any real URL: it fetches the page, takes
+a fingerprint of the actual fetched bytes (a contiguous slice of the real response
+body), confirms that exact fingerprint is present in the network region, wipes,
+then confirms the fingerprint is gone. Because the marker is the real fetched
+content rather than a planted string, the proof holds against a real site like
+`http://example.com/` driven interactively, not only the deterministic local
+server. The boot test runs it against the local server and, best-effort, against
+`example.com` over the live internet.
 
 Honest limits: one TCP connection at a time, HTTP/1.0, polling rather than
 interrupts, no congestion control, and only minimal retransmit. It is enough to
@@ -467,6 +481,10 @@ then asserts the markers that can only appear if each subsystem worked:
 - a Kindling program running in-session that prints 76127 for the sum of primes
   below 1000 and confirms 561 is a Carmichael number, plus two parameterized
   compute calls giving input-dependent results,
+- the compute resource-isolation probe, two hostile Kindling programs (unbounded
+  recursion and an ever-growing value) that each trip a clean limit error, after
+  which a normal `compute 123 + 456` still answers 579, proving a user program
+  cannot crash the kernel and the shell survives,
 - the EL0 isolation probe, an EL0 task that makes a legitimate syscall and then
   faults reading the vault directly, with the kernel reporting the denial and
   continuing,
@@ -486,10 +504,11 @@ then asserts the markers that can only appear if each subsystem worked:
   deterministic without external internet,
 - a best-effort live HTTPS fetch of `https://example.com/` over the real internet,
   which is printed and not a hard failure when offline,
-- the amnesia of fetched bytes, a payload with a sentinel fetched into the network
-  buffers over both HTTP and TLS, then wiped, then the sentinel scanned to zero
-  across the whole network region (proving the decrypted TLS plaintext is scrubbed
-  too),
+- the amnesia of fetched bytes, a fingerprint of the real fetched body taken over
+  both HTTP and TLS, present in the network region before the wipe and scanned to
+  zero across the whole region after (proving the decrypted TLS plaintext is
+  scrubbed too), plus a best-effort run of the same real-bytes proof against
+  `http://example.com/` over the live internet,
 - a best-effort live DNS lookup through the built-in nameserver, which prints the
   A record when online and is not a hard failure when offline,
 - a clean power-off, which means the machine exited through semihosting.
