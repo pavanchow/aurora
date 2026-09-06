@@ -10,7 +10,7 @@
 
 use crate::sync::SpinLock;
 use crate::vault::{Vault, MAX_VAL};
-use crate::{entropy, kindling, mem, print, println};
+use crate::{entropy, kindling, mem, native_task, print, println};
 
 /// Hard cap on Kindling instructions per compute run: a runaway agent program
 /// cannot hang the single-core kernel, it traps with a step-limit error instead.
@@ -301,15 +301,33 @@ pub fn run_task(name: &str) -> bool {
             true
         }
         "sum" => {
-            // Parameterized: `run sum <n>` sums 1..=n (defaults to 100).
-            let n: u64 = arg.and_then(|a| a.parse().ok()).unwrap_or(100);
-            let mut acc: u64 = 0;
-            for i in 1..=n {
-                acc = acc.wrapping_add(i);
+            // Parameterized: `run sum <n>` sums 1..=n (defaults to 100). This runs
+            // as native EL1 code with no VM step limit, so the argument is validated
+            // and the work is bounded: a malformed argument returns a clean error,
+            // and the summation never loops more than NATIVE_TASK_WORK_LIMIT times.
+            // Below the cap the original wrapping loop runs unchanged. At or above
+            // it the closed form gives the identical wrapping answer instantly, so
+            // even `run sum 18446744073709551615` returns at once instead of hanging.
+            match native_task::parse_count_arg(arg, 100) {
+                Ok(n) => {
+                    let acc = if n <= native_task::NATIVE_TASK_WORK_LIMIT {
+                        let mut a: u64 = 0;
+                        for i in 1..=n {
+                            a = a.wrapping_add(i);
+                        }
+                        a
+                    } else {
+                        native_task::triangular_sum(n)
+                    };
+                    scratch[..8].copy_from_slice(&acc.to_le_bytes());
+                    println!("  -> sum(1..={}) = {}", n, acc);
+                    true
+                }
+                Err(native_task::ArgError::Malformed) => {
+                    println!("  -> argument too large or invalid (expected a number 0..=u64::MAX)");
+                    true
+                }
             }
-            scratch[..8].copy_from_slice(&acc.to_le_bytes());
-            println!("  -> sum(1..={}) = {}", n, acc);
-            true
         }
         "vault-demo" => {
             if has_cap(CAP_VAULT) {

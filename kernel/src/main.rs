@@ -23,6 +23,7 @@ mod heap;
 mod isolation;
 mod kindling;
 mod mem;
+mod native_task;
 mod net;
 mod mmu;
 mod persistence;

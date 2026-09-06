@@ -33,6 +33,9 @@ pub mod heap;
 #[path = "../../kernel/src/vault.rs"]
 pub mod vault;
 
+#[path = "../../kernel/src/native_task.rs"]
+pub mod native_task;
+
 #[path = "../../kernel/src/ptable.rs"]
 pub mod ptable;
 
