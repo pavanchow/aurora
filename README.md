@@ -233,7 +233,9 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `exit`              | wipe and power the machine off cleanly               |
 
 The line editor supports insert-anywhere editing, left and right cursor
-movement, delete, and an up and down arrow command history.
+movement, delete, and an up and down arrow command history. The history is a
+bounded ring of the last 128 command lines, each length-capped, so its memory
+stays constant however many commands are entered.
 
 The compute surface is a real language. `compute 40 + 2` prints 42, and a
 multi-line program can define functions, loop, and print. For example, entering

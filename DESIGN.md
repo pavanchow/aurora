@@ -646,7 +646,11 @@ The commands report live kernel state and drive the amnesic model directly:
 `ps` reads the scheduler, `uptime` reads the timer, `mem` reads the heap, frames,
 and the durable-write count, `session` and `run` drive the agent session model,
 `vault` puts and gets encrypted secrets, and `wipe` and `panic` trigger a scrub.
-No shell history is retained across a wipe.
+No shell history is retained across a wipe. The up and down arrow history is a
+bounded ring of the last 128 command lines, each capped at 256 bytes, so the
+memory it holds is a small constant no matter how many commands are entered. A
+flood of tens of thousands of distinct long lines cannot grow it until the heap
+is exhausted (see `kernel/src/history.rs` and the history-flood boot-test gate).
 
 ## How the boot test proves correctness
 
