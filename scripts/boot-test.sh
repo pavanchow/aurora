@@ -700,6 +700,97 @@ else
 fi
 rm -f "$COUT"
 
+# --- Slow-dribble receive-deadline gate --------------------------------------
+# A hostile TLS peer that accepts the connection, sends a record header claiming
+# a body just under TLS_REC_MAX, then dribbles that body ONE byte every ~50ms and
+# never completes the record. The record never completes, so HandshakeBudget is
+# never charged, and tls_tcp_fill reports progress on every byte, so the idle
+# counter never trips. Before the fix this pinned the single core for 75s+ and
+# `fetch` never returned. The total per-fetch receive deadline (absolute, not
+# reset by an arriving byte) must now abort the fetch PROMPTLY with a clean error,
+# and the shell must answer a normal command afterward. A regression means the
+# fetch hangs and QEMU is killed by the watchdog (rc 124), failing the gate.
+info "[dribble-gate] separate QEMU run: a 1-byte/50ms TLS record dribble must hit the receive deadline, not hang"
+DRIB_PORT="$(free_port)"
+python3 - "$DRIB_PORT" <<'PY' >/dev/null 2>&1 &
+import socket, sys, threading, time
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(8)
+# A HANDSHAKE record header claiming a body just under TLS_REC_MAX (17408), then
+# the body one byte every 50ms, forever. The record never completes, so the
+# handshake record/byte budget is never charged and the per-record idle counter
+# never trips (every byte looks like progress). Only an ABSOLUTE per-fetch
+# deadline can stop this.
+BODY = 17000
+def handle(c):
+    try:
+        c.sendall(bytes([22, 0x03, 0x03, (BODY >> 8) & 0xff, BODY & 0xff]))
+        while True:
+            c.sendall(b"\x00")
+            time.sleep(0.05)
+    except Exception:
+        pass
+    try:
+        c.close()
+    except Exception:
+        pass
+while True:
+    try:
+        c, _ = s.accept()
+    except Exception:
+        break
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PY
+DRIB_PID=$!
+disown "$DRIB_PID" 2>/dev/null || true
+wait_port "$DRIB_PORT"
+
+DOUT="$(mktemp)"
+DSTART=$(date +%s)
+{
+    printf 'session start\n'
+    printf 'cap net\n'
+    printf 'fetch -k https://10.0.2.2:%s/x\n' "$DRIB_PORT"
+    printf 'compute 7 + 7\n'
+    printf 'exit\n'
+} | run_with_timeout 45 \
+        "$QEMU" -M virt -cpu max -m 512 -nographic -semihosting \
+        -global virtio-mmio.force-legacy=false \
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+        -kernel "$ELF" >"$DOUT" 2>&1
+DRIB_RC=$?
+DEND=$(date +%s)
+kill "$DRIB_PID" >/dev/null 2>&1
+echo "----------------------------------------------------------------"
+cat "$DOUT"
+echo "----------------------------------------------------------------"
+info "[dribble-gate] elapsed $((DEND-DSTART))s (a 75s+ hang would be killed at the 45s watchdog)"
+
+require_d() { # description, pattern (fixed-string)
+    if grep -qF -- "$2" "$DOUT"; then
+        green "  ok   $1"
+    else
+        red   "  MISS $1  (expected to find: $2)"
+        FAIL=1
+    fi
+}
+
+require_d "dribble-gate hit the receive deadline"  "[net] receive deadline exceeded (connection too slow)"
+require_d "dribble-gate shell alive after dribble" "-> 14"
+require_d "dribble-gate clean shutdown"            "[shutdown] powering off"
+# A prompt clean exit (rc 0) proves the dribble no longer hangs the core: a
+# regression spins on the never-completing record and QEMU is killed with rc 124.
+if [ "$DRIB_RC" -ne 0 ]; then
+    red   "  MISS dribble-gate QEMU did not exit cleanly (rc=$DRIB_RC; 124 means the dribble hung the core)"
+    FAIL=1
+else
+    green "  ok   dribble-gate QEMU exited 0 (dribble did not hang the core)"
+fi
+rm -f "$DOUT"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     green "BOOT TEST PASSED"
