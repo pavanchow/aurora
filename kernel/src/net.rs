@@ -1181,10 +1181,20 @@ fn https_get(
     chrec[5..5 + chlen].copy_from_slice(&ch[..chlen]);
     tls_tcp_send(&mut t, &chrec[..5 + chlen]);
 
+    // A single work budget for the whole exchange: a peer cannot make us process
+    // an unbounded number of records (for example a ChangeCipherSpec flood that
+    // the loops skip) regardless of what it sends. Every record read below is
+    // charged, so no record type can be used to spin the core.
+    let mut budget = tls::HandshakeBudget::new();
+
     // ServerHello (plaintext handshake record; skip any ChangeCipherSpec).
     let server_pub;
     loop {
-        let _total = tls_read_record(&mut t, &mut stream_len)?;
+        let total = tls_read_record(&mut t, &mut stream_len)?;
+        if !budget.charge(total) {
+            println!("[tls] handshake exceeded record/byte budget");
+            return None;
+        }
         let ts = unsafe { &mut *nb_tls() };
         if ts.rec[0] == tls::CT_CHANGE_CIPHER_SPEC {
             continue;
@@ -1220,6 +1230,10 @@ fn https_get(
     let mut done = false;
     while !done {
         let total = tls_read_record(&mut t, &mut stream_len)?;
+        if !budget.charge(total) {
+            println!("[tls] handshake exceeded record/byte budget");
+            return None;
+        }
         {
             let ts = unsafe { &mut *nb_tls() };
             match ts.rec[0] {
@@ -1296,6 +1310,10 @@ fn https_get(
     // Post-handshake handshake messages (NewSessionTicket) are ignored.
     let mut total_body = 0usize;
     while let Some(rlen) = tls_read_record(&mut t, &mut stream_len) {
+        if !budget.charge(rlen) {
+            println!("[tls] exceeded post-handshake record/byte budget");
+            break;
+        }
         let ts = unsafe { &mut *nb_tls() };
         match ts.rec[0] {
             tls::CT_CHANGE_CIPHER_SPEC => continue,

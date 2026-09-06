@@ -50,6 +50,69 @@ pub const HS_CERTIFICATE: u8 = 11;
 pub const HS_CERTIFICATE_VERIFY: u8 = 15;
 pub const HS_FINISHED: u8 = 20;
 
+// --- Handshake work budget ---------------------------------------------------
+//
+// A TLS 1.3 handshake is a handful of records and a few kilobytes: ServerHello,
+// an optional ChangeCipherSpec, then the EncryptedExtensions/Certificate/
+// CertificateVerify/Finished flight. The record read only bounds an idle
+// connection (no bytes arriving), so a peer that streams records which never
+// advance the handshake, for example a ChangeCipherSpec flood the loops skip
+// with a bare `continue`, keeps making "progress" and pins the single core for
+// as long as it keeps sending. This budget caps the total records and total
+// bytes charged across the whole exchange so any such stream aborts with a clean
+// error instead of spinning forever. The ceilings sit far above a real
+// handshake, so legitimate peers never see them.
+pub const HS_MAX_RECORDS: u32 = 512;
+pub const HS_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(Clone)]
+pub struct HandshakeBudget {
+    records: u32,
+    bytes: usize,
+    max_records: u32,
+    max_bytes: usize,
+}
+
+impl HandshakeBudget {
+    pub fn new() -> Self {
+        Self::with_limits(HS_MAX_RECORDS, HS_MAX_BYTES)
+    }
+
+    pub fn with_limits(max_records: u32, max_bytes: usize) -> Self {
+        Self {
+            records: 0,
+            bytes: 0,
+            max_records,
+            max_bytes,
+        }
+    }
+
+    /// Charge one record of `rec_bytes` against the budget. Returns `true` while
+    /// the connection stays within both the record and byte ceilings, and
+    /// `false` the moment either is crossed, at which point the caller must abort
+    /// the handshake. Every record read counts, including record types the
+    /// handshake loops skip, so no record type can be used to spin the core.
+    pub fn charge(&mut self, rec_bytes: usize) -> bool {
+        self.records = self.records.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(rec_bytes);
+        self.records <= self.max_records && self.bytes <= self.max_bytes
+    }
+
+    pub fn records(&self) -> u32 {
+        self.records
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Default for HandshakeBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // --- HKDF (RFC 5869) over HMAC-SHA256 ----------------------------------------
 
 /// HKDF-Extract: PRK = HMAC-Hash(salt, IKM).
@@ -817,6 +880,47 @@ mod tests {
         assert_eq!(&out[64..64 + 33], b"TLS 1.3, server CertificateVerify");
         assert_eq!(out[64 + 33], 0);
         assert_eq!(&out[64 + 34..n], &th[..]);
+    }
+
+    #[test]
+    fn handshake_budget_caps_record_flood() {
+        // A ChangeCipherSpec flood is 6-byte records that never advance the
+        // handshake. The record ceiling must abort it long before the byte
+        // ceiling and long before it can spin the core.
+        let mut b = HandshakeBudget::new();
+        let mut charged = 0u32;
+        while b.charge(6) {
+            charged += 1;
+            assert!(charged <= HS_MAX_RECORDS, "flood must abort at the record cap");
+        }
+        assert_eq!(charged, HS_MAX_RECORDS, "aborts exactly at the record ceiling");
+        assert_eq!(b.records(), HS_MAX_RECORDS + 1);
+    }
+
+    #[test]
+    fn handshake_budget_caps_byte_flood() {
+        // Even under a generous record cap, a stream of large records must trip
+        // the byte ceiling.
+        let mut b = HandshakeBudget::with_limits(1_000_000, HS_MAX_BYTES);
+        let mut n = 0;
+        while b.charge(17408) {
+            n += 1;
+            assert!(n < 100, "byte ceiling must fire");
+        }
+        assert!(b.bytes() > HS_MAX_BYTES, "aborted after crossing the byte cap");
+    }
+
+    #[test]
+    fn handshake_budget_allows_normal_handshake() {
+        // A real TLS 1.3 handshake: ServerHello, ChangeCipherSpec, then the
+        // EncryptedExtensions/Certificate/CertificateVerify/Finished flight. None
+        // of it may trip either ceiling.
+        let mut b = HandshakeBudget::new();
+        for sz in [90usize, 6, 4096, 2048, 128, 90] {
+            assert!(b.charge(sz), "a normal handshake stays within budget");
+        }
+        assert!(b.records() < HS_MAX_RECORDS);
+        assert!(b.bytes() < HS_MAX_BYTES);
     }
 
     #[test]
