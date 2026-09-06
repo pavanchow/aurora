@@ -90,8 +90,39 @@ Rust IRQ dispatcher, switches to the stack pointer that dispatcher returns, then
 restores and returns. The synchronous handler from EL1h reads `ESR_EL1`, routes
 an `SVC` to the syscall dispatcher, and treats anything else as a fault. The
 fault path decodes the exception class, prints `ESR_EL1`, `FAR_EL1`, `ELR`, and
-`SPSR`, and halts. Any panic or fault also triggers a wipe before the machine
-stops. All other vector slots route to that same fault printer.
+`SPSR`, then scrubs before it stops. All other vector slots route to that same
+fault printer.
+
+An unrecoverable EL1 fault is treated as a kill-switch trigger. Before the fault
+handler halts, it calls the same `wipe` the panic path and the shell use, so the
+session key, the vault, the frame pool, the network buffers, and the free stack
+are zeroed even on a crash. It then rescans the managed session RAM for the
+amnesia sentinel and prints how many copies remain, which is zero after a good
+scrub, so a crash produces the same measured proof a clean wipe does. The scrub
+runs in a fault context, so it stays simple and non-allocating and touches only
+mapped regions, never the guard page. One context is not fully covered: a genuine
+deep EL1h stack overflow faults on the stack-push at exception entry itself, and
+that entry re-faults against the guard page a handful of times, marching the
+saved trap frames across the 4 KiB guard into the top of the heap before the
+push finally lands on mapped memory and the wipe path runs. Those few kilobytes
+of trap frames sit in the heap, which a running-kernel wipe does not scrub, so
+that one pathological path is a best-effort scrub rather than a complete one. The
+parser nesting bound below removes the only reachable trigger for such an
+overflow from the compute surface, and the key and vault live in reserved regions
+above the stack that a downward overflow never reaches and that the wipe zeros
+regardless.
+
+### Stack guard page
+
+The linker reserves a 4 KiB guard page directly below the kernel stack, between
+the heap and `__stack_bottom`. The MMU refines the 2 MiB region that holds it
+down to 4 KiB pages and leaves that one page invalid, while every other page in
+the region stays identity-mapped. A stack overflow grows down past the stack
+bottom into this page and faults at a fixed, known boundary, which routes into
+the wipe-then-halt fault path above, instead of silently scribbling into the heap
+that sits below the stack. The same unmapped page is what the `faulttest` shell
+command writes to when it deliberately raises a fatal data abort to exercise the
+fault-path scrub.
 
 Because the entire saved context of a task is a `TrapFrame` on the task's own
 stack, a handler that returns a different stack pointer performs a context
@@ -207,8 +238,22 @@ loop cannot hang the single core. A call-depth limit (1024 frames) turns unbound
 recursion into a "recursion limit exceeded" error instead of exhausting the stack
 and heap. A live-heap ceiling (256 KiB, well under the 4 MiB kernel heap) turns an
 ever-growing value into a "compute memory limit exceeded" error instead of OOMing
-the global allocator. When any limit trips, the error is printed, the compute
-scratch is scrubbed, and the shell keeps running and accepts the next command. The
+the global allocator.
+
+Those three are runtime limits, but the compile step in front of the VM recurses
+too. The recursive-descent parser descends once per level of expression grouping,
+prefix `!`/`-`, call, and binary nesting, and a deeply nested program (a few
+thousand nested `(` or `!`) used to overflow the native kernel stack during
+parsing and take a raw EL1 data abort before any VM limit could apply, which
+halted the kernel without wiping. The parser now threads an explicit nesting
+counter through those recursive productions and aborts with a clean "nesting too
+deep" compile error once the depth passes 256, chosen with a wide margin below the
+few-thousand depth where the stack was seen to fault. The compiler carries a
+matching defensive bound as it walks the tree. Both surface as ordinary compile
+errors, so a hostile deeply-nested program is rejected before it runs and the
+shell keeps going, exactly like the runtime limits. When any limit trips, the
+error is printed, the compute scratch is scrubbed, and the shell keeps running and
+accepts the next command. The
 program text is staged in a session scratch buffer that is scrubbed on the way out.
 This is what lets an agent define a function, loop, sum the primes below 1000, or
 factor a number entirely inside the session rather than being limited to a few

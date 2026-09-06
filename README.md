@@ -45,17 +45,26 @@ throwaway compute.
   zeros, then cleans and invalidates the data cache. It can be triggered from the
   shell `wipe` command, a wipe syscall, a kernel panic, and normal shutdown. The
   wipe duration is measured and printed in CPU cycles.
+- Wipes even on a crash. Any unrecoverable EL1 fault scrubs the session before it
+  halts and then reprints the sentinel count, which is zero, so a data abort
+  cannot leave the key or vault resident. An unmapped guard page sits directly
+  below the kernel stack, so a stack overflow faults at a known boundary and
+  routes into that wipe-then-halt path instead of scribbling into other memory.
+  The `faulttest` command exercises this path on purpose.
 - Keeps decrypted secrets off the stack. The vault put and get staging buffers
   and the session read buffer are zeroed with volatile writes the instant an
   operation finishes, so a read secret does not survive on the kernel stack.
 - Runs a sandboxed in-OS interpreter. The from-scratch Kindling bytecode language
   (lexer, parser, compiler, stack VM, garbage collector, zero dependencies) is
   embedded in the kernel and gated by CAP_COMPUTE. A Kindling program has no file,
-  network, or system access, it can only compute and print, and three resource
-  limits (instruction count, call depth, and live heap bytes) stop a runaway or
-  hostile program: unbounded recursion and ever-growing allocation each return a
-  clean runtime error instead of crashing the kernel, and the shell keeps running.
-  This is Aurora's general compute surface for an agent.
+  network, or system access, it can only compute and print, and three runtime
+  resource limits (instruction count, call depth, and live heap bytes) stop a
+  runaway or hostile program: unbounded recursion and ever-growing allocation
+  each return a clean runtime error instead of crashing the kernel, and the shell
+  keeps running. A fourth, compile-time bound caps expression nesting depth, so a
+  deeply nested program (thousands of nested `(` or `!`) is rejected with a clean
+  "nesting too deep" error before it can overflow the native kernel stack during
+  parsing. This is Aurora's general compute surface for an agent.
 - Enforces isolation in hardware. Agent code can run at EL0 with its own
   translation permissions, so a user task cannot read or write the vault, the
   session key, or any other kernel RAM directly. An attempt faults to the kernel,
@@ -188,6 +197,7 @@ machine off cleanly), or press `Ctrl-A` then `X`.
 | `el0test`           | run an EL0 user task that must fault on kernel RAM   |
 | `wipe`              | scrub the key, vault, frames, network buffers, and free stack to zero |
 | `panic`             | trigger a panic, which wipes before halting          |
+| `faulttest`         | raise a deliberate fatal EL1 fault; proves the handler wipes and the sentinel is gone before halting |
 | `exit`              | wipe and power the machine off cleanly               |
 
 The line editor supports insert-anywhere editing, left and right cursor
