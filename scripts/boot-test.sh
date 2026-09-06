@@ -65,6 +65,12 @@ repeat_char() {
     python3 -c "import sys; sys.stdout.write(sys.argv[1]*int(sys.argv[2]))" "$1" "$2"
 }
 
+# Emit COUNT copies of a string (used to build deep assignment / if / while / call
+# chains for the parser recursion-bound gates).
+repeat_str() {
+    python3 -c "import sys; sys.stdout.write(sys.argv[1]*int(sys.argv[2]))" "$1" "$2"
+}
+
 free_port() {
     python3 - <<'PY'
 import socket
@@ -193,16 +199,73 @@ shell_script() {
     # clean compile error BEFORE the native kernel stack overflows into a data
     # abort. Fed as multi-line compute programs so no single UART line is huge.
     printf 'compute\n'
-    for _ in $(seq 1 40); do printf '%s\n' "$(repeat_char '(' 500)"; done
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char '(' 500)"; done
     printf '1;\n'
     printf '.\n'
     printf 'compute\n'
-    for _ in $(seq 1 40); do printf '%s\n' "$(repeat_char '!' 500)"; done
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char '!' 500)"; done
     printf 'true;\n'
     printf '.\n'
     # Proof the shell survived the deep-nesting programs: a distinctive result
     # (111 + 222 = 333).
     printf 'compute 111 + 222\n'
+    # Uniform parser recursion bound across EVERY production. Each hostile shape
+    # below (deep right-assoc assignment, nested blocks, nested if, nested while,
+    # a deep call chain, and a long binary-operator chain) must trip the shared
+    # nesting bound and return a clean compile error, with NO data abort, panic,
+    # or halt. Each is fed thousands of levels deep, far past the 512 cap and past
+    # the depth at which the kernel used to overflow, yet kept under the total
+    # program-size cap so the lexer never OOMs before the parser bound engages.
+    # Assignment and blocks are also fed single-line. After EACH shape a
+    # distinctive normal compute must still answer, proving the shell stayed alive.
+    # deep right-associative assignment.
+    printf 'compute %s1;\n' "$(repeat_str 'a=' 800)"
+    printf 'compute\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_str 'a=' 500)"; done
+    printf '1;\n'
+    printf '.\n'
+    printf 'compute 10 + 1\n'
+    # nested blocks.
+    printf 'compute %s%s\n' "$(repeat_char '{' 1500)" "$(repeat_char '}' 1500)"
+    printf 'compute\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char '{' 500)"; done
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char '}' 500)"; done
+    printf '.\n'
+    printf 'compute 10 + 2\n'
+    # nested if.
+    printf 'compute\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_str 'if(1){' 500)"; done
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char '}' 500)"; done
+    printf '.\n'
+    printf 'compute 10 + 3\n'
+    # nested while.
+    printf 'compute\n'
+    for _ in $(seq 1 3); do printf '%s\n' "$(repeat_str 'while(1){' 500)"; done
+    for _ in $(seq 1 3); do printf '%s\n' "$(repeat_char '}' 500)"; done
+    printf '.\n'
+    printf 'compute 10 + 4\n'
+    # deep call chain f(f(f(...))).
+    printf 'compute\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_str 'f(' 500)"; done
+    printf '1\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_char ')' 500)"; done
+    printf ';\n'
+    printf '.\n'
+    printf 'compute 10 + 5\n'
+    # long binary-operator chain: each operator deepens the left-nested tree, so it
+    # trips the same bound rather than building a tree too deep to compile or drop.
+    printf 'compute\n'
+    printf '1\n'
+    for _ in $(seq 1 4); do printf '%s\n' "$(repeat_str '+1' 500)"; done
+    printf ';\n'
+    printf '.\n'
+    printf 'compute 10 + 6\n'
+    # Total program budget: a huge but shallow program (over the 16 KiB program
+    # cap across many lines) must hit "program too large" cleanly, never OOM.
+    printf 'compute\n'
+    for _ in $(seq 1 60); do printf '%s\n' "$(repeat_char '1' 400)"; done
+    printf '.\n'
+    printf 'compute 10 + 7\n'
     # Amnesia of network buffers: fetch the local payload, take a fingerprint of
     # the REAL fetched bytes, wipe, then prove that exact fingerprint is gone from
     # the whole network scratch region. Deterministic against the local server.
@@ -307,6 +370,19 @@ require "shell alive after crash"  "-> 579"
 # must still answer a normal command afterwards.
 require "deep nesting rejected"      "nesting too deep"
 require "shell alive after nesting"  "-> 333"
+
+# Uniform recursion bound: each crashing shape returns a clean nesting/too-large
+# error, and a distinctive normal compute answers after each, proving the shell
+# survived that specific shape (no data abort, panic, or halt in between).
+require "deep assignment survived"   "-> 11"
+require "nested blocks survived"     "-> 12"
+require "nested if survived"         "-> 13"
+require "nested while survived"      "-> 14"
+require "deep call chain survived"   "-> 15"
+require "long binary chain survived" "-> 16"
+# Total program budget: a huge shallow program is rejected cleanly, shell alive.
+require "program too large rejected" "program too large"
+require "shell alive after too-large" "-> 17"
 
 # EL0 isolation: a user task makes a legit syscall, then faults trying to read
 # the vault directly, and the kernel recovers instead of halting.
@@ -438,6 +514,11 @@ require_f "fault-gate planted a sentinel"        "[faulttest] sentinel present"
 require_f "fault-gate wiped on the fault"        "[wipe] scrubbed"
 require_f "fault-gate proved sentinel scrubbed"  "secret plaintext appears 0 times"
 require_f "fault-gate halted"                    "*** halted ***"
+
+# Fault-stack edge closed: the trap frame is saved on the dedicated exception
+# stack, never pushed below the stack guard page into the heap.
+require_f "fault-gate frame on exception stack"  "on exception stack = true"
+require_f "fault-gate frame not in heap"         "in heap = false"
 
 # The planted sentinel must have been present pre-fault (not 0), else the proof is
 # vacuous.
