@@ -20,6 +20,7 @@ mod exceptions;
 mod frame_alloc;
 mod gic;
 mod heap;
+mod history;
 mod isolation;
 mod kindling;
 mod mem;

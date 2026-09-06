@@ -4,9 +4,10 @@
 //! `exec` dispatcher is driven both by the live interactive loop and by the
 //! scripted boot demo, so the commands are exercised either way.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::history::History;
 use crate::runqueue::{State, MAX_TASKS};
 use crate::{mem, persistence, print, println, sched, session, syscall, timer, uart};
 
@@ -355,24 +356,13 @@ fn read_line(history: &[String]) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn remember(history: &mut Vec<String>, line: &str) {
-    let line = line.trim();
-    if line.is_empty() {
-        return;
-    }
-    if history.last().map(|l| l.as_str()) == Some(line) {
-        return;
-    }
-    history.push(line.to_string());
-}
-
 /// Interactive read-eval-print loop over the UART. Exits on the `exit` command.
 pub fn run() -> ! {
-    let mut history: Vec<String> = Vec::new();
+    let mut history = History::new();
     loop {
         print!("{}", PROMPT);
-        let line = read_line(&history);
-        remember(&mut history, &line);
+        let line = read_line(history.entries());
+        history.remember(&line);
 
         if line.trim() == "compute" {
             // Multi-line program entry: accumulate until a lone '.' line.
@@ -381,7 +371,7 @@ pub fn run() -> ! {
             let mut overflow = false;
             loop {
                 print!("... ");
-                let l = read_line(&history);
+                let l = read_line(history.entries());
                 if l.trim() == "." {
                     break;
                 }
