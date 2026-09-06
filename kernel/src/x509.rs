@@ -29,6 +29,7 @@ const OID_SHA256_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 
 const OID_RSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3 commonName
 const OID_SAN: &[u8] = &[0x55, 0x1D, 0x11]; // 2.5.29.17 subjectAltName
+const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13]; // 2.5.29.19 basicConstraints
 
 // ---- Public API -----------------------------------------------------------
 
@@ -75,6 +76,14 @@ pub struct Cert<'a> {
     pub sig_alg: SigAlg,
     /// signatureValue BIT STRING contents, unused-bits byte stripped.
     pub signature: &'a [u8],
+
+    /// Raw DER of the issuer Name, the full TLV (tag+len+contents). These are the
+    /// exact bytes that must equal a candidate issuer certificate's subject Name
+    /// for the two to chain, so the comparison is a byte-for-byte DER match.
+    pub issuer: &'a [u8],
+    /// Raw DER of the subject Name, the full TLV. Compared against a child
+    /// certificate's `issuer` when walking a chain.
+    pub subject_raw: &'a [u8],
 
     // Internal borrowed regions kept for lazy field access.
     subject: &'a [u8],           // RDNSequence contents (inside the SEQUENCE)
@@ -126,8 +135,13 @@ pub fn parse_certificate(der: &[u8]) -> Option<Cert<'_>> {
     rest = skip_one(rest)?;
     // signature AlgorithmIdentifier
     rest = skip_one(rest)?;
-    // issuer Name
-    rest = skip_one(rest)?;
+    // issuer Name (capture the full TLV for chain matching)
+    let (t_iss, _, iss_len) = read_tlv(rest)?;
+    if t_iss != TAG_SEQUENCE {
+        return None;
+    }
+    let issuer = rest.get(..iss_len)?;
+    rest = rest.get(iss_len..)?;
 
     // validity SEQUENCE { notBefore, notAfter }
     let (t_val, val_body, val_len) = read_tlv(rest)?;
@@ -145,6 +159,7 @@ pub fn parse_certificate(der: &[u8]) -> Option<Cert<'_>> {
     if t_sub != TAG_SEQUENCE {
         return None;
     }
+    let subject_raw = rest.get(..sub_len)?;
     rest = rest.get(sub_len..)?;
 
     // subjectPublicKeyInfo SEQUENCE { algorithm, subjectPublicKey }
@@ -191,6 +206,8 @@ pub fn parse_certificate(der: &[u8]) -> Option<Cert<'_>> {
         not_after,
         sig_alg,
         signature,
+        issuer,
+        subject_raw,
         subject,
         extensions,
     })
@@ -306,6 +323,50 @@ impl<'a> Cert<'a> {
         let n = if n.first() == Some(&0x00) { n.get(1..)? } else { n };
         Some((n, e))
     }
+
+    /// The basicConstraints CA flag. True only when the extension is present with
+    /// `cA = TRUE`. A missing extension, or `cA = FALSE`, is false, so a leaf can
+    /// never stand in as a chain issuer.
+    pub fn is_ca(&self) -> bool {
+        let exts = match self.extensions {
+            Some(e) => e,
+            None => return false,
+        };
+        let mut r = exts;
+        while let Some((tag, ext, consumed)) = read_tlv(r) {
+            if tag == TAG_SEQUENCE {
+                if let Some((t_oid, oid, oid_len)) = read_tlv(ext) {
+                    if t_oid == TAG_OID && oid == OID_BASIC_CONSTRAINTS {
+                        if let Some(after) = ext.get(oid_len..) {
+                            return basic_constraints_ca(after);
+                        }
+                    }
+                }
+            }
+            r = match r.get(consumed..) {
+                Some(x) => x,
+                None => break,
+            };
+        }
+        false
+    }
+
+    /// The SEC1 uncompressed point (0x04 || X || Y, 65 bytes) for a P-256 key.
+    pub fn ec_p256_point(&self) -> Option<&'a [u8]> {
+        if self.spki_alg != SpkiAlg::EcP256 || self.spki_key.len() != 65 || self.spki_key[0] != 0x04
+        {
+            return None;
+        }
+        Some(self.spki_key)
+    }
+
+    /// The raw 32-byte public key for an Ed25519 certificate.
+    pub fn ed25519_key(&self) -> Option<&'a [u8]> {
+        if self.spki_alg != SpkiAlg::Ed25519 || self.spki_key.len() != 32 {
+            return None;
+        }
+        Some(self.spki_key)
+    }
 }
 
 // ---- SAN helper (kept out of the closure to satisfy the borrow checker) ----
@@ -338,6 +399,34 @@ fn emit_san(after_oid: &[u8], want_tag: u8, f: &mut impl FnMut(&[u8])) {
             Some(x) => x,
             None => break,
         };
+    }
+}
+
+// ---- basicConstraints helper ----------------------------------------------
+fn basic_constraints_ca(after_oid: &[u8]) -> bool {
+    let mut rest = after_oid;
+    // optional critical BOOLEAN
+    if let Some((tb, _, cb)) = read_tlv(rest) {
+        if tb == TAG_BOOLEAN {
+            rest = match rest.get(cb..) {
+                Some(x) => x,
+                None => return false,
+            };
+        }
+    }
+    // extnValue OCTET STRING wrapping SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
+    let octet = match read_tlv(rest) {
+        Some((t, o, _)) if t == TAG_OCTETSTRING => o,
+        _ => return false,
+    };
+    let seq = match read_tlv(octet) {
+        Some((t, s, _)) if t == TAG_SEQUENCE => s,
+        _ => return false,
+    };
+    // cA BOOLEAN (optional, DEFAULT FALSE): present and TRUE (0xFF) means a CA.
+    match read_tlv(seq) {
+        Some((t, v, _)) if t == TAG_BOOLEAN => v.first() == Some(&0xFF),
+        _ => false,
     }
 }
 

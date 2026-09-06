@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod amnesia;
+mod bigint;
 mod boot;
 mod crypto;
 mod ed25519;
