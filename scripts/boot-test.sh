@@ -194,6 +194,27 @@ shell_script() {
     # Proof the shell survived both hostile programs: a normal compute still
     # answers with a distinctive result (123 + 456 = 579).
     printf 'compute 123 + 456\n'
+    # Total-budget arenas the old per-GC-heap guard never counted. Each of these
+    # grew an allocation OUTSIDE the GC object heap until the global 4 MiB kernel
+    # heap was exhausted and the kernel panic-halted. They must now trip the total
+    # per-run budget cleanly, leaving the shell alive.
+    # Finding A: deep recursion where each frame keeps many locals live on the VM
+    # value stack. The value-stack bytes now count toward the budget, so this trips
+    # the memory ceiling well before the 4 MiB heap OOMs. Distinct 700+77=777 after.
+    A_LOCALS="$(python3 -c "print(''.join('let v%d=n;'%i for i in range(40)))")"
+    A_SUM="$(python3 -c "print('+'.join('v%d'%i for i in range(40)))")"
+    printf 'compute\n'
+    printf 'fn r(n){ %s return r(%s+1); }\n' "$A_LOCALS" "$A_SUM"
+    printf 'r(0);\n'
+    printf '.\n'
+    printf 'compute 700 + 77\n'
+    # Finding B: a plain print inside a while loop grows the run output string
+    # (flushed only after the run). The output is now capped and truncated with a
+    # notice instead of growing without bound, so the shell survives. 800+88=888.
+    printf 'compute\n'
+    printf 'let i=0; while(i<200000){ print "spam"; i=i+1; } print "loopdone";\n'
+    printf '.\n'
+    printf 'compute 800 + 88\n'
     # Parser recursion bound: a deeply nested program (20000 nested '(' then,
     # separately, 20000 nested '!') must trip the parser nesting cap and return a
     # clean compile error BEFORE the native kernel stack overflows into a data
@@ -365,6 +386,16 @@ require "recursion limit trips"    "[compute] error: recursion limit exceeded"
 require "heap limit trips"         "[compute] error: compute memory limit exceeded"
 require "shell alive after crash"  "-> 579"
 
+# Total-budget arenas that used to escape the guard (value stack + output).
+# Finding A: deep-locals recursion trips the total budget (value-stack bytes now
+# counted) instead of OOMing the kernel, and the shell answers 777 afterward.
+require "value-stack budget trips"   "[compute] error: compute memory limit exceeded"
+require "shell alive after locals"   "-> 777"
+# Finding B: a print loop's output is capped and truncated with a notice rather
+# than growing until the kernel heap OOMs, and the shell answers 888 afterward.
+require "output cap truncates loop"  "output truncated"
+require "shell alive after prints"   "-> 888"
+
 # Parser recursion bound: deeply nested '(' and '!' programs must be rejected with
 # a clean "nesting too deep" compile error (no data abort, no halt), and the shell
 # must still answer a normal command afterwards.
@@ -457,6 +488,11 @@ require "clean shutdown"         "[shutdown] powering off"
 # No crashes, and the amnesia proof must not have failed.
 refute "no CPU exception"        "\*\*\* EXCEPTION"
 refute "no panic"                "\[panic\]"
+# A compute run must never reach the global allocator's failure path or halt the
+# kernel: the total per-run budget trips first, so these must be absent entirely.
+refute "no alloc-error handler"  "handle_alloc_error"
+refute "no alloc failure"        "memory allocation of [0-9]+ bytes failed"
+refute "no halt on compute"      "\*\*\* halted \*\*\*"
 refute "amnesia did not fail"    "\[amnesia\] FAIL"
 refute "netamnesia did not fail" "\[netamnesia\] FAIL"
 
