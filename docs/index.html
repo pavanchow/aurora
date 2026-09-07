@@ -6,6 +6,7 @@
 <title>Aurora: an amnesic RAM-only aarch64 kernel for AI agents</title>
 <meta name="description" content="Aurora by Pavan Nallamothu: a real bootable aarch64 kernel, Tails rebuilt for AI agents. It runs entirely in RAM, keeps an encrypted vault in memory with from-scratch ChaCha20-Poly1305, speaks a from-scratch TLS 1.3 client, and scrubs the session key and every byte it protected to zero on wipe, panic, and shutdown. no_std, no_main, zero external crates, proven amnesic in QEMU on every build.">
 <meta name="author" content="Pavan Nallamothu (pavanchow)">
+<meta name="keywords" content="amnesic operating system, RAM-only kernel, aarch64 kernel, no_std Rust kernel, Tails for AI agents, ChaCha20-Poly1305, TLS 1.3 from scratch, EL0 isolation, secure wipe, QEMU virt, agent sandbox, bare-metal Rust, Pavan Nallamothu, pavanchow">
 <link rel="canonical" href="https://pavanchow.github.io/aurora/">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <link rel="author" href="https://github.com/pavanchow">
@@ -17,7 +18,7 @@
 <meta name="twitter:title" content="Aurora: an amnesic RAM-only aarch64 kernel for AI agents">
 <meta name="twitter:description" content="Tails, rebuilt for agents. Secrets stay encrypted in RAM and are scrubbed to zero on wipe. The boot test proves the secret is gone, inside QEMU, every build.">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Aurora","applicationCategory":"DeveloperApplication","operatingSystem":"bare-metal aarch64 (QEMU virt)","description":"Aurora is a real bootable aarch64 kernel written from scratch in Rust, no_std and no_main with zero external crates. It runs entirely in RAM behind a durable-write guard, keeps an encrypted in-memory vault with from-scratch ChaCha20-Poly1305 (RFC 8439), isolates agent code at EL0, speaks a from-scratch TLS 1.3 client with hand-written Ed25519, ECDSA P-256, and RSA verification, and scrubs the session key and every byte it protected to zero on wipe, panic, and shutdown, proven by a boot test in QEMU.","url":"https://pavanchow.github.io/aurora/","author":{"@type":"Person","name":"Pavan Nallamothu"},"programmingLanguage":"Rust","codeRepository":"https://github.com/pavanchow/aurora","license":"https://opensource.org/licenses/MIT"}
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Aurora","applicationCategory":"DeveloperApplication","softwareVersion":"0.1.0","operatingSystem":"bare-metal aarch64 (QEMU virt)","description":"Aurora is a real bootable aarch64 kernel written from scratch in Rust, no_std and no_main with zero external crates. It runs entirely in RAM behind a durable-write guard, keeps an encrypted in-memory vault with from-scratch ChaCha20-Poly1305 (RFC 8439), isolates agent code at EL0, speaks a from-scratch TLS 1.3 client with hand-written Ed25519, ECDSA P-256, and RSA verification, and scrubs the session key and every byte it protected to zero on wipe, panic, and shutdown, proven by a boot test in QEMU.","url":"https://pavanchow.github.io/aurora/","author":{"@type":"Person","name":"Pavan Nallamothu"},"programmingLanguage":"Rust","codeRepository":"https://github.com/pavanchow/aurora","license":"https://opensource.org/licenses/MIT"}
 </script>
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"Person","name":"Pavan Nallamothu","alternateName":"pavanchow","url":"https://github.com/pavanchow","sameAs":["https://github.com/pavanchow","https://hackerone.com/pavanchow"]}
@@ -100,6 +101,7 @@
   nav .brand .gem { width: 15px; height: 15px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
   nav .links { display: flex; gap: 24px; align-items: center; }
   nav .links a { color: var(--text); font-size: 14.5px; }
+  nav .links .v { color: var(--muted); font-family: var(--mono); font-size: 12px; }
   @media (max-width: 640px){ nav .links a:not(.gh){ display: none; } }
 
   /* Hero */
@@ -252,8 +254,16 @@
   .band .grid3 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 34px; }
   @media (max-width: 780px){ .band .grid3 { grid-template-columns: 1fr; } }
   .band .fcard { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px 24px; box-shadow: var(--shadow); }
-  .band .fcard h3 { margin: 0 0 8px; font-size: 18px; letter-spacing: -.02em; }
+  .band .fcard h3 { margin: 0 0 8px; font-size: 18px; letter-spacing: -.02em; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
   .band .fcard p { margin: 0; color: var(--muted); font-size: 15px; }
+  .ptag { font-family: var(--mono); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); }
+  .cmp { max-width: 820px; margin: 34px auto 0; }
+  .cmp .crow { display: grid; grid-template-columns: minmax(140px, 1fr) 2fr; gap: 12px 34px; padding: 22px 0; border-top: 1px solid var(--line); }
+  .cmp .crow:first-child { border-top: none; }
+  .cmp .crow b { font-size: 17px; letter-spacing: -.01em; }
+  .cmp .crow p { color: var(--muted); font-size: 15px; margin: 0; }
+  .cmp .crow.self b { color: var(--accent); }
+  @media (max-width: 640px){ .cmp .crow { grid-template-columns: 1fr; gap: 5px; } }
   pre.block { background: #15161c; color: #ececf4; border-radius: 14px; padding: 20px 22px; font-family: var(--mono); font-size: 13px; line-height: 1.6; overflow-x: auto; max-width: 840px; margin: 30px auto 0; white-space: pre; }
   pre.block .cm { color: #8a8d9a; } pre.block .g { color: #7fd6a0; } pre.block .p { color: #5eead4; }
 
@@ -269,7 +279,7 @@
 
 <nav><div class="row">
   <div class="brand"><img src="logo.svg" class="brandlogo" alt="" width="22" height="22">Aurora</div>
-  <div class="links"><a href="#sim">Model</a><a href="#proof">Proof</a><a href="#inside">Inside</a><a href="#use">Build it</a><a class="gh" href="https://github.com/pavanchow/aurora">GitHub</a></div>
+  <div class="links"><a href="#sim">Model</a><a href="#proof">Proof</a><a href="#compare">Compare</a><a href="#inside">Inside</a><a href="#use">Build it</a><a class="gh" href="https://github.com/pavanchow/aurora">GitHub</a><span class="v">v0.1.0</span></div>
 </div></nav>
 
 <header class="hero">
@@ -394,24 +404,43 @@ total <span class="g">195 passed, 0 failed</span>   <span class="cm"># ChaCha20/
   <p class="lead" style="margin-top:26px">Every from-scratch cryptographic primitive is checked against its official RFC or NIST known-answer vectors, and the amnesia claim is proven inside QEMU on every build. The full boot transcript is committed at <code>docs/boot-test.log</code>.</p>
 </div></section>
 
+<section class="band" id="compare"><div class="wrap">
+  <h2 class="big">Where Aurora sits</h2>
+  <p class="lead">The amnesic idea is not new. Aurora's contribution is to make "leave nothing behind" small enough to read end to end and to prove it on every build, for agent workloads rather than people.</p>
+  <div class="cmp">
+    <div class="crow"><b>Tails and other amnesiac live systems</b><p>A mature amnesiac OS, a full live Linux that forgets when the machine powers off. Built for a human at a desktop, with the whole general-purpose stack behind it.</p></div>
+    <div class="crow"><b>From-scratch and unikernel teaching kernels</b><p>Boot on QEMU virt and show how a kernel comes up: MMU, timer, scheduler, syscalls. They teach the machine, but forgetting and authenticated networking are not the point they are making.</p></div>
+    <div class="crow self"><b>Aurora</b><p>A real bootable aarch64 kernel in that from-scratch lineage, rebuilt around amnesia for agents. It adds an in-RAM encrypted vault, an EL0 isolation boundary, a hand-written authenticated TLS 1.3 client, and a measured wipe on demand, on panic, and on shutdown, all with zero external crates and a boot test that asserts the secret is gone.</p></div>
+  </div>
+  <p class="lead" style="margin-top:26px">No wall-clock revocation, no secure boot, no defense against a physical bus or cold-RAM attacker. The <a href="https://github.com/pavanchow/aurora#honest-limits">honest limits</a> are written down in full, not glossed over.</p>
+</div></section>
+
 <section class="band" id="inside"><div class="wrap">
   <h2 class="big">A real kernel, written from scratch</h2>
   <p class="lead">Under the amnesic core visualized above sits a full aarch64 kernel: boot from EL2 down to EL1, a PL011 UART console, an MMU with caches on, a bitmap frame allocator and a free-list heap, GICv2 with a 100 Hz timer, a preemptive scheduler with an assembly context switch, and SVC syscalls. All of it, and the crypto, the network stack, and the TLS client, written by hand with zero external crates.</p>
   <div class="grid3">
     <div class="fcard">
-      <h3>Runs untrusted code</h3>
+      <h3>Amnesic core <span class="ptag">wipe</span></h3>
+      <p>A persistence guard sits in front of every storage path and refuses each durable write, so the count stays zero. On command, on a syscall, on panic, and on shutdown the wipe scrubs the key first, then the vault, the frame pool, and the free kernel stack, and times itself in CPU cycles. The boot test scans for the sentinel and asserts it is gone.</p>
+    </div>
+    <div class="fcard">
+      <h3>Encrypted in-RAM vault <span class="ptag">crypto</span></h3>
+      <p>ChaCha20, Poly1305, and the ChaCha20-Poly1305 AEAD written from scratch to RFC 8439 and checked against the RFC's own vectors. Secrets rest as nonce, ciphertext, and a 16-byte tag; the plaintext never sits in the vault. The key comes from the ARMv8.5 RNDR hardware RNG when the CPU has one and falls back to timer jitter otherwise, telling you which it used.</p>
+    </div>
+    <div class="fcard">
+      <h3>Runs untrusted code <span class="ptag">sandbox</span></h3>
       <p>It embeds Kindling, a small language written from scratch with a lexer, parser, compiler, stack VM, and garbage collector, sandboxed behind a capability. Resource limits stop a runaway or hostile program with a clean error instead of taking the kernel down. It sums the primes below 1000 to 76127 and confirms 561 is a Carmichael number.</p>
     </div>
     <div class="fcard">
-      <h3>Isolates in hardware</h3>
+      <h3>Isolates in hardware <span class="ptag">EL0</span></h3>
       <p>Agent code runs at EL0 and simply cannot read or write the vault, the key, or kernel memory. Try and it faults, the kernel notes it and carries on, while real syscalls still work. Every syscall that takes a user pointer validates the whole range against the caller's own memory first.</p>
     </div>
     <div class="fcard">
-      <h3>Talks to the internet, on a leash</h3>
+      <h3>Talks to the internet, on a leash <span class="ptag">net</span></h3>
       <p>A from-scratch virtio-net driver and a full stack through Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, and HTTP/1.0 give an agent a real path to pull bytes off the wire, behind a capability that is off by default and revocable. Every network buffer, including the fetched body, lives in the region the wipe scrubs.</p>
     </div>
     <div class="fcard">
-      <h3>Authenticates who it talks to</h3>
+      <h3>Authenticates who it talks to <span class="ptag">tls 1.3</span></h3>
       <p><code>fetch https://host/path</code> runs a from-scratch TLS 1.3 client that verifies the certificate chain up to a trusted root, checks the CertificateVerify is bound to the leaf, and matches the host name, with Ed25519, ECDSA P-256, and RSA verification hand-written on a from-scratch big-integer core and checked against the standard vectors.</p>
     </div>
   </div>
