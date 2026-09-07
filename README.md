@@ -1,3 +1,5 @@
+<img src="docs/logo.svg" alt="Aurora logo" width="96">
+
 # Aurora
 
 Aurora is an operating system for work you want to leave no trace of. Think of it as Tails, rebuilt for AI agents. It boots on ARM64, runs entirely in RAM, keeps its secrets encrypted while they sit in memory, and scrubs everything to zero the moment you are done. Nothing ever touches a disk, so when a session ends there is nothing left to find.

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Aurora - amnesic RAM-only kernel</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg">
 <style>
   :root {
     --bg: #f5f5f7;
@@ -212,10 +213,17 @@
   ol.howto li { margin: 8px 0; }
   .howto code { font-family: var(--mono); background: var(--panel-2); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
   .sublabel { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+  details.howto-details > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; margin: 0; }
+  details.howto-details > summary::-webkit-details-marker { display: none; }
+  details.howto-details > summary h2 { margin: 0; }
+  details.howto-details > summary::before { content: ""; width: 9px; height: 9px; border-right: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(-45deg); transition: transform .2s; flex: none; }
+  details.howto-details[open] > summary::before { transform: rotate(45deg); }
+  details.howto-details > .howto { margin-top: 14px; }
 </style>
 </head>
 <body>
 <header>
+  <img src="logo.svg" alt="Aurora logo" width="72" height="72" style="display:block;margin:0 0 12px">
   <h1>Aurora</h1>
   <p class="tag">Tails for agents. An amnesic, encrypted, RAM-only aarch64 kernel that runs ephemeral work and leaves nothing behind. Secrets stay encrypted in RAM, and on wipe or shutdown the key and the session memory are scrubbed to zero.</p>
   <p class="note">This page is a browser visualization of the amnesic model, not the kernel itself. The ciphertext below is produced by a real ChaCha20 keystream (RFC 8439) running in your browser, the authentication tag shown is illustrative. The real bootable kernel and full source are at <a href="https://github.com/pavanchow/aurora">github.com/pavanchow/aurora</a>.</p>
@@ -304,7 +312,8 @@
   </section>
 
   <section class="panel">
-    <h2>How to use this visualization</h2>
+    <details class="howto-details">
+    <summary><h2>How to use this visualization</h2></summary>
     <ol class="howto">
       <li><b>Step through a session.</b> Press <code>Next step</code> to advance one stage at a time, or <code>Play</code> to auto-advance. Press <code>Back</code> to revisit a stage, and <code>Reset</code> to start over.</li>
       <li><b>Watch the key appear.</b> At <code>session start</code> a fresh session key is generated and shown byte by byte. This key encrypts every secret in the vault.</li>
@@ -313,6 +322,7 @@
       <li><b>Wipe.</b> The wipe runs in order. The <b>key is zeroed first</b>, then the vault region, then the frame pool. Watch the ciphertext and the sentinel fall to <code>00</code>, and the sentinel readout turn to zeros.</li>
       <li><b>Confirm nothing remains.</b> At the end the key is gone, all managed RAM reads zero, and <code>durable writes this session</code> is still <code>0</code>. A stolen or imaged machine would yield nothing.</li>
     </ol>
+    </details>
   </section>
 </main>
 

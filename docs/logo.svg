@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Aurora logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#g)"/>
+  <g fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round">
+    <path d="M22 48 C38 34 50 62 66 48 S94 34 108 50" opacity="0.95"/>
+    <path d="M22 68 C38 56 52 82 66 68 S94 58 108 70" opacity="0.55"/>
+    <path d="M24 88 C40 78 52 100 66 88 S92 80 104 90" opacity="0.25"/>
+  </g>
+  <g fill="#fff">
+    <circle cx="40" cy="34" r="3"/>
+    <circle cx="92" cy="30" r="2.4"/>
+    <circle cx="100" cy="98" r="2.2" opacity="0.5"/>
+  </g>
+</svg>
