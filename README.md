@@ -6,6 +6,8 @@ Aurora is a from-scratch amnesic aarch64 operating system kernel in Rust for wor
 
 **[Live demo](https://pavanchow.github.io/aurora/)** · MIT licensed · pure Rust, no_std, zero crates
 
+Built from scratch by [Pavan Nallamothu](https://pavanchow.github.io/) ([LinkedIn](https://www.linkedin.com/in/pavanchow/), [GitHub](https://github.com/pavanchow)).
+
 It is a real kernel, not a simulation. Every line under `kernel/` is code the CPU runs at EL1. You build it for `aarch64-unknown-none`, QEMU loads the ELF at `0x4008_0000`, and the machine comes up on its own: virtual memory, interrupts, a scheduler, syscalls, an encrypted vault, and an interactive shell on the serial port. It is written in Rust, `no_std`, `no_main`, with zero external crates. Every piece, the crypto, the network stack, the TLS client, and the little language it runs, was written from scratch and lives in this repo.
 
 ## Why it exists
