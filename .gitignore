@@ -1,3 +1,22 @@
 target/
 **/target/
 Cargo.lock
+
+# Never commit SSH, key, or credential material.
+.ssh/
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.netrc
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+
+# Exception: the Aurora test PKI roots are committed deliberately so the
+# trusted root public key stays stable and can be embedded in the kernel
+# trust store. See scripts/gen-testchain.sh.
+!scripts/tls-testchain/*.key
