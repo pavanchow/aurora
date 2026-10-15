@@ -69,6 +69,19 @@ pub fn init() {
     }
 }
 
+/// Rebuild the heap allocator over its reserved region. Only the amnesia boot
+/// gate uses this: its heap sentinel runs the forced wipe, which scrubs the heap
+/// bytes (including the allocator's own intrusive free-list nodes), so the free
+/// list must be reconstructed before the kernel allocates again. Safe here only
+/// because nothing live is held on the heap across the gate.
+pub fn reinit_heap() {
+    unsafe {
+        let hstart = sym(&__heap_start);
+        let hend = sym(&__heap_end);
+        ALLOCATOR.0.lock().init(hstart, hend - hstart);
+    }
+}
+
 pub fn heap_total() -> usize {
     ALLOCATOR.0.lock().total_bytes()
 }

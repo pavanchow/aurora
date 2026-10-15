@@ -136,6 +136,40 @@ pub fn prove() -> bool {
         se.saturating_sub(sb)
     );
 
+    // Heap-resident sentinel. The normal wipe() leaves the in-use heap untouched
+    // by design, so the heap is the one place a secret-derived byte (TLS records,
+    // net buffers, a format! temporary) could survive. Plant a known pattern on
+    // the heap, run the forced lock-free wipe (which DOES scrub the heap), and
+    // prove zero residue across the whole heap region.
+    let (hs, he) = mem::heap_region_range();
+    let mut heap_buf = alloc::vec::Vec::<u8>::with_capacity(8192);
+    heap_buf.resize(8192, 0);
+    {
+        let base = heap_buf.as_mut_ptr() as usize;
+        let n = SENTINEL.len();
+        let mut off = 0;
+        while off + n <= heap_buf.len() {
+            for (i, &b) in SENTINEL.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((base + off + i) as *mut u8, b) };
+            }
+            off += n;
+        }
+    }
+    let heap_pre = scan(hs, he, SENTINEL);
+    // The forced wipe is about to zero the allocator's own free-list nodes, so
+    // leak this allocation rather than freeing it into an allocator we will nuke.
+    core::mem::forget(heap_buf);
+
+    wipe::wipe_forced();
+    let heap_post = scan(hs, he, SENTINEL);
+    println!(
+        "[amnesia] post-wipe heap scan: sentinel plaintext appears {} times across {} bytes (in-use heap)",
+        heap_post,
+        he - hs
+    );
+    // Rebuild the heap the forced wipe just scrubbed so the rest of boot can allocate.
+    mem::reinit_heap();
+
     let durable = persistence::durable_writes();
     println!(
         "[persistence] durable writes this session: {} (RAM-only enforced), {} attempt(s) refused",
@@ -143,13 +177,18 @@ pub fn prove() -> bool {
         persistence::refused_attempts()
     );
 
-    let pass = pre > 0 && post == 0 && stack_post == 0 && durable == 0;
+    let pass = pre > 0
+        && post == 0
+        && stack_post == 0
+        && durable == 0
+        && heap_pre > 0
+        && heap_post == 0;
     if pass {
-        println!("[amnesia] PASS: session RAM and kernel stack are clean, sentinel fully scrubbed, zero durable writes");
+        println!("[amnesia] PASS: session RAM, kernel stack, and in-use heap are clean, sentinel fully scrubbed, zero durable writes");
     } else {
         println!(
-            "[amnesia] FAIL: pre={} post={} stack_post={} durable={} (expected pre>0, post=0, stack_post=0, durable=0)",
-            pre, post, stack_post, durable
+            "[amnesia] FAIL: pre={} post={} stack_post={} heap_pre={} heap_post={} durable={} (expected pre>0, post=0, stack_post=0, heap_pre>0, heap_post=0, durable=0)",
+            pre, post, stack_post, heap_pre, heap_post, durable
         );
     }
     pass

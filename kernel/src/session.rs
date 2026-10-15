@@ -117,7 +117,15 @@ fn vault_region() -> &'static mut [u8] {
 /// Start a new agent session: fresh key, empty encrypted vault, default caps.
 pub fn start() -> u64 {
     let key = entropy::session_key();
-    *VAULT.lock() = Some(Vault::new(vault_region(), key));
+    {
+        // Drop any prior vault (releasing its &'static mut to the region) BEFORE
+        // building the new one, so the fresh &mut from vault_region() is never
+        // live alongside the old one. Evaluating Vault::new() inline in the
+        // assignment would hold two &mut to the same bytes at once (UB).
+        let mut g = VAULT.lock();
+        drop(g.take());
+        *g = Some(Vault::new(vault_region(), key));
+    }
     let mut s = SESSION.lock();
     s.id += 1;
     s.active = true;
@@ -437,6 +445,19 @@ fn scrub_compute_scratch() {
 pub fn zero_key_first() -> usize {
     let mut g = VAULT.lock();
     match g.as_mut() {
+        Some(v) => v.zero_key(),
+        None => 0,
+    }
+}
+
+/// Zero the session key WITHOUT taking the VAULT lock. For the forced panic/fault
+/// wipe only: a fault taken mid-vault-operation may already hold this lock, and a
+/// single core re-taking it would deadlock. Returns bytes zeroed.
+///
+/// # Safety
+/// Caller must guarantee no concurrent VAULT access (the halting fault path).
+pub unsafe fn zero_key_forced() -> usize {
+    match VAULT.force_access().as_mut() {
         Some(v) => v.zero_key(),
         None => 0,
     }

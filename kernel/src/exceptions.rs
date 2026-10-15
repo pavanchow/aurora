@@ -262,6 +262,12 @@ extern "C" fn rust_lower_sync_handler(sp: usize) -> usize {
 
 #[no_mangle]
 extern "C" fn rust_fault_handler(sp: usize, kind: u64) -> ! {
+    // Kill switch FIRST, before any println! (UART lock) or vault/session lock:
+    // scrub session RAM lock-free. A fault taken while a secret operation already
+    // holds one of those locks must still wipe, and re-taking a held lock on a
+    // single core would deadlock. The diagnostics below are best-effort reporting.
+    let scrubbed = crate::wipe::wipe_forced();
+
     let esr = esr_el1();
     let far = far_el1();
     let frame = unsafe { &*(sp as *const TrapFrame) };
@@ -287,15 +293,15 @@ extern "C" fn rust_fault_handler(sp: usize, kind: u64) -> ! {
         sp, on_estack, in_heap
     );
 
-    // An unrecoverable EL1 fault is a kill-switch trigger: scrub session RAM
-    // before halting so a crash cannot leave the key, vault, or fetched bytes
-    // resident. The scrub runs in a fault context, so it stays simple and
-    // non-allocating and touches only mapped regions (never the guard page).
-    let report = crate::wipe::wipe_and_report();
+    // The kill-switch scrub already ran lock-free at entry; just report it.
     let remaining = crate::amnesia::fault_sentinel_count();
     println!(
-        "[fault] post-scrub sentinel scan: secret plaintext appears {} times in session RAM ({} bytes scrubbed)",
-        remaining, report.bytes
+        "[wipe] scrubbed {} bytes (forced, lock-free: key+vault+frames+net+heap+stack), caches flushed",
+        scrubbed
+    );
+    println!(
+        "[fault] post-scrub sentinel scan: secret plaintext appears {} times in session RAM",
+        remaining
     );
     println!("*** halted ***");
     loop {

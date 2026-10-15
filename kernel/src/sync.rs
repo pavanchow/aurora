@@ -29,6 +29,17 @@ impl<T> SpinLock<T> {
         }
         SpinGuard { lock: self }
     }
+
+    /// Reach the data without taking the lock. Only for the forced panic/fault
+    /// wipe, which must scrub even when the faulting context already holds this
+    /// lock: taking it again on a single core would spin forever, so the kill
+    /// switch bypasses it. Sound there because all other execution is stopped.
+    ///
+    /// # Safety
+    /// Caller must guarantee no concurrent access (the halting fault path).
+    pub unsafe fn force_access(&self) -> &mut T {
+        &mut *self.data.get()
+    }
 }
 
 pub struct SpinGuard<'a, T> {

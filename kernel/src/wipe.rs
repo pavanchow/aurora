@@ -145,6 +145,58 @@ pub fn wipe() -> WipeReport {
     WipeReport { bytes, cycles, freq_hz: cntfrq() }
 }
 
+/// Unconditional, lock-free wipe for the panic/fault path. Scrubs the key and
+/// every physical session range WITHOUT taking the VAULT/UART/SESSION/net locks
+/// and without printing or allocating, so a fault taken mid-secret-operation
+/// (while one of those locks is held) still scrubs instead of deadlocking on a
+/// spinlock a single core would re-enter. This is the security-defining path and
+/// must never block. Returns bytes scrubbed.
+///
+/// Unlike `wipe()` it also scrubs the whole in-use heap (where TLS/net/`format!`
+/// allocations land) and intentionally destroys the allocator's own free-list
+/// nodes living there: the machine halts after a forced wipe, except in the
+/// amnesia gate, which rebuilds the heap afterward.
+pub fn wipe_forced() -> usize {
+    // 1. Key material dies first, without taking the VAULT lock.
+    let key_bytes = unsafe { session::zero_key_forced() };
+
+    // 2. Vault region, frame pool, network scratch. Scrub the netbuf bytes
+    //    directly; do NOT call net::on_wipe() here (it takes a lock).
+    let (vs, ve) = mem::vault_region_range();
+    scrub(vs, ve);
+    let (fs, fe) = mem::frame_pool_range();
+    scrub(fs, fe);
+    let (ns, ne) = mem::netbuf_region_range();
+    scrub(ns, ne);
+
+    // 3. The entire in-use heap.
+    let (hs, he) = mem::heap_region_range();
+    scrub(hs, he);
+
+    // 4. The free part of the kernel stack below SP (same policy as wipe()).
+    let (sb, st) = mem::stack_region_range();
+    let sp = sp_now();
+    let se = if sp > sb && sp <= st {
+        (sp.saturating_sub(256)) & !0xF
+    } else {
+        st
+    };
+    let stack_bytes = se.saturating_sub(sb);
+    if stack_bytes > 0 {
+        scrub(sb, se);
+    }
+
+    clean_invalidate(vs, ve);
+    clean_invalidate(fs, fe);
+    clean_invalidate(ns, ne);
+    clean_invalidate(hs, he);
+    if stack_bytes > 0 {
+        clean_invalidate(sb, se);
+    }
+
+    key_bytes + (ve - vs) + (fe - fs) + (ne - ns) + (he - hs) + stack_bytes
+}
+
 /// Wipe and print a one-line report. Shared by the shell, syscall, and shutdown.
 pub fn wipe_and_report() -> WipeReport {
     let r = wipe();
