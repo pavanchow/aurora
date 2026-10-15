@@ -307,7 +307,7 @@ impl Scheduler for Mlfq {
         }
         // Also reset the recorded level of any running process so that when it
         // is re-admitted it starts at the top.
-        for (_pid, level) in self.level_of.iter_mut() {
+        for level in self.level_of.values_mut() {
             *level = 0;
         }
     }
